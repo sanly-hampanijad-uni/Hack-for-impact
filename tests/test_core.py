@@ -1,0 +1,199 @@
+import copy
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
+
+from spark_cve.agents import CONDITIONS, investigate, uncertain, validate_assessment
+from spark_cve.clients import NVD, Ollama, ServiceError, normalize_cve
+from spark_cve.reporting import write_reports
+from spark_cve.tools import Repository
+
+
+def record(identifier="CVE-2026-12345", published="2026-11-12T12:00:00.000", severity="HIGH"):
+    return {"id": identifier, "published": published, "lastModified": published,
+            "descriptions": [{"lang": "en", "value": "Mock component condition for transport tests, not a real CVE."}],
+            "metrics": {"cvssMetricV31": [{"source": "nvd@nist.gov", "type": "Primary",
+                        "cvssData": {"version": "3.1", "baseSeverity": severity, "baseScore": 8.1}}]}}
+
+
+def answer(ids, status="UNCERTAIN"):
+    result = uncertain("Need deployed toolchain and reachability evidence")
+    result["status"] = status
+    result["conditions"] = [{"name": name, "finding": "unknown", "explanation": "Not established", "evidence_ids": ids}
+                            for name in CONDITIONS]
+    return result
+
+
+class RepositoryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "go.mod").write_text("module example.test/app\n\ngo 1.23.0\nrequire (\n golang.org/x/net v0.1.0 // indirect\n)\nreplace golang.org/x/net => ../net\n")
+        (self.root / "main.go").write_text('package main\nfunc main() { println("hello") }\n')
+        (self.root / ".env").write_text("DO_NOT_READ=private")
+        self.repo = Repository(self.root)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_boundaries_and_secrets(self):
+        for name in ("../outside.go", ".env"):
+            with self.assertRaises(ValueError):
+                self.repo.read_file(name)
+        (self.root / "linked.go").symlink_to(self.root / "main.go")
+        with self.assertRaises(ValueError):
+            self.repo.read_file("linked.go")
+        self.assertEqual(set(self.repo.list_files()["files"]), {"go.mod", "main.go"})
+
+    def test_dependency_declarations_and_replacements(self):
+        dependencies = self.repo.inspect_dependencies()
+        manifest = dependencies["manifests"][0]
+        self.assertEqual(manifest["declared_requirements"][0]["version"], "v0.1.0")
+        self.assertIn("replace", manifest["manifest"])
+        self.assertEqual(dependencies["resolution"], "unresolved")
+
+    def test_read_search_and_comparison(self):
+        self.assertEqual(self.repo.read_file("main.go", 2, 2)["lines"], ['2: func main() { println("hello") }'])
+        self.assertEqual(self.repo.search_code("PRINTLN")["matches"][0]["line"], 2)
+        self.assertEqual(self.repo.compare_versions("v1.9.0", "v1.10.0")["comparison"], "less")
+        self.assertEqual(self.repo.compare_versions("v0.0.0-20200101000000-abcdef", "v1.0.0")["comparison"], "unknown")
+
+    def test_execution_disabled_and_errors_recorded(self):
+        item = self.repo.invoke("reviewer", "run_check", {"check_id": "go_test"})
+        self.assertIn("error", item["result"])
+        self.assertEqual(item["id"], "E1")
+        self.assertIn("error", self.repo.invoke("a", "read_file", {"path": "../oops.go"})["result"])
+
+    def test_snapshot_detects_changes(self):
+        old = self.repo.snapshot
+        (self.root / "main.go").write_text("package changed")
+        self.assertNotEqual(old, self.repo.fingerprint())
+
+    def test_docker_runner_is_fixed_isolated_and_stages_filtered_source(self):
+        self.repo.allow_execution = True
+        with patch("spark_cve.tools.subprocess.Popen") as popen, patch("spark_cve.tools.subprocess.run"):
+            popen.return_value.wait.return_value = 0
+            def inspect_command(command, **kwargs):
+                source = command[command.index("--mount") + 1].split("src=")[1].split(",dst=")[0]
+                self.assertFalse((Path(source) / ".env").exists())
+                self.assertTrue((Path(source) / "go.mod").exists())
+                self.assertIn("--network=none", command)
+                self.assertIn("--read-only", command)
+                self.assertIn("--cap-drop=ALL", command)
+                return popen.return_value
+            popen.side_effect = inspect_command
+            self.assertEqual(self.repo.run_check("go_test")["exit_code"], 0)
+
+
+class NVDTests(unittest.TestCase):
+    def test_transient_errors_retry_but_permanent_errors_do_not(self):
+        attempts = []
+        def flaky(url, **kwargs):
+            attempts.append(url)
+            if len(attempts) < 3:
+                raise ServiceError("busy", status=503)
+            return {"vulnerabilities": [{"cve": record()}]}
+        self.assertEqual(NVD(transport=flaky, sleep=lambda _: None).get("CVE-2026-12345")["id"], "CVE-2026-12345")
+        self.assertEqual(len(attempts), 3)
+
+    def test_pagination_sorting_and_severity(self):
+        calls = []
+        def transport(url, **kwargs):
+            params = parse_qs(urlparse(url).query)
+            index = int(params["startIndex"][0])
+            calls.append(index)
+            rows = [record("CVE-2026-10001", "2026-11-12T01:00:00.000"),
+                    record("CVE-2026-10002", "2026-11-12T02:00:00.000", "LOW"),
+                    record("CVE-2026-10003", "2026-11-12T03:00:00.000", "CRITICAL")]
+            return {"totalResults": 3, "vulnerabilities": [{"cve": rows[index]}]}
+        rows = NVD(transport=transport, sleep=lambda _: None).recent(2)
+        self.assertEqual(calls, [0, 1, 2])
+        self.assertEqual([r["id"] for r in rows], ["CVE-2026-10003", "CVE-2026-10001"])
+
+    def test_failure_is_not_fallback(self):
+        def fail(*args, **kwargs):
+            raise ServiceError("offline")
+        with self.assertRaises(ServiceError):
+            NVD(transport=fail).recent()
+
+    def test_unknown_score_and_invalid_cve(self):
+        row = record()
+        row["metrics"] = {}
+        self.assertEqual(normalize_cve(row)["severity"], "UNSCORED")
+        with self.assertRaises(ValueError):
+            NVD().get("bad-id")
+
+    def test_key_only_sent_in_header(self):
+        def transport(url, **kwargs):
+            self.assertNotIn("test-key", url)
+            self.assertEqual(kwargs["headers"], {"apiKey": "test-key"})
+            return {"vulnerabilities": [{"cve": record()}]}
+        self.assertEqual(NVD("test-key", transport=transport).get("CVE-2026-12345")["id"], "CVE-2026-12345")
+
+
+class AgentTests(unittest.TestCase):
+    def test_evidence_gates(self):
+        evidence = [{"id": "E1", "tool": "read_file", "result": {"lines": ["1: example"]}}]
+        data = answer(["E1"], "AFFECTED")
+        with self.assertRaises(ValueError):
+            validate_assessment(data, evidence)
+        for c in data["conditions"]:
+            c["finding"] = "proven"
+        self.assertEqual(validate_assessment(data, evidence)["status"], "AFFECTED")
+        data["conditions"][0]["evidence_ids"] = ["E999"]
+        with self.assertRaises(ValueError):
+            validate_assessment(data, evidence)
+
+    def test_cannot_claim_reproduction_from_generic_tests(self):
+        data = answer([])
+        data["reproduction_status"] = "succeeded"
+        with self.assertRaises(ValueError):
+            validate_assessment(data, [])
+
+    def test_ollama_local_only_and_no_hidden_thinking(self):
+        with self.assertRaises(ValueError):
+            Ollama("https://hosted.example")
+        def transport(url, **kwargs):
+            self.assertEqual(kwargs["payload"]["keep_alive"], "30m")
+            return {"message": {"role": "assistant", "content": "test", "thinking": "private"}}
+        self.assertNotIn("thinking", Ollama(transport=transport).chat([]))
+
+    def test_two_agents_real_tool_dispatch_report_pipeline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "go.mod").write_text("module example.test/app\ngo 1.23.0\n")
+            repo = Repository(root)
+            messages = [
+                {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "inspect_dependencies", "arguments": {}}}]},
+                {"role": "assistant", "content": json.dumps(answer(["E1"]))},
+                {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "go.mod"}}}]},
+                {"role": "assistant", "content": json.dumps(answer(["E2"]))},
+            ]
+            class ScriptedModel:
+                model = "test-transport-not-real-inference"
+                def chat(self, *args, **kwargs):
+                    return messages.pop(0)
+            events = []
+            result = investigate(normalize_cve(record()), repo, ScriptedModel(), lambda *a, **kw: events.append((a, kw)))
+            self.assertEqual(result["assessment"]["status"], "UNCERTAIN")
+            self.assertEqual([e["agent"] for e in result["evidence"]], ["investigator", "reviewer"])
+            write_reports(root, [result])
+            self.assertIn("E2", (root / "report.md").read_text())
+            self.assertEqual(len(json.loads((root / "report.json").read_text())), 1)
+            self.assertEqual(messages, [])
+
+    def test_model_failure_yields_uncertain(self):
+        with tempfile.TemporaryDirectory() as root:
+            class FailingModel:
+                model = "test"
+                def chat(self, *args, **kwargs):
+                    raise ServiceError("unavailable")
+            result = investigate(normalize_cve(record()), Repository(root), FailingModel(), lambda *a, **k: None)
+            self.assertEqual(result["assessment"]["status"], "UNCERTAIN")
+
+
+if __name__ == "__main__":
+    unittest.main()

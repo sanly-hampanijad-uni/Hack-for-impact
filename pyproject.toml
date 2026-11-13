@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spark-cve"
+version = "0.1.0"
+description = "Evidence-led Go CVE investigations using local Nemotron inference"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+spark-cve = "spark_cve.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["spark_cve*"]
