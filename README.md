@@ -1,4 +1,4 @@
-# Le Plan
+# Vulnerability Generation Agent
 
 [Hack for Impact Sheffield](https://events.nvidia.com/Hack-for-Impact-Sheffield)
 
@@ -23,3 +23,4 @@
 **The Goal:** Develop systems that improve how cities function behind the scenes and in real time.
 
 ## What We Are Making
+Proof of concept: When a CVE is discovered. You supply your codebase, and our agent will determine whether your application is vulnerable, explains the evidence, and suggests a fix.
