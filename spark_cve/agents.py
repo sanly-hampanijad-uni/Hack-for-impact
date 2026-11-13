@@ -100,6 +100,11 @@ def validate_assessment(data, evidence, condition_names=None, plan=None):
             raise ValueError(f"Invalid {key}")
     if data["status"] not in {"AFFECTED", "NOT AFFECTED", "UNCERTAIN"}:
         raise ValueError("Invalid verdict")
+    narrative = data.get("summary", "") + "\n" + data.get("review_notes", "")
+    stated_verdicts = set(re.findall(r"\b(?:NOT AFFECTED|AFFECTED|UNCERTAIN)\b", narrative))
+    contradictory = stated_verdicts - {data["status"]}
+    if contradictory:
+        raise ValueError(f"Narrative contradicts derived {data['status']} verdict: {sorted(contradictory)}")
     if data["reproduction_status"] not in {"instructions_only", "not_run", "executed_unverified"}:
         raise ValueError("Invalid reproduction status")
     if not isinstance(data["conditions"], list):
@@ -129,11 +134,33 @@ def validate_assessment(data, evidence, condition_names=None, plan=None):
             raise ValueError("Definite verdict requires all prerequisite assessments")
         if not any(e["tool"] in {"read_file", "inspect_dependencies"} and "error" not in e["result"] for e in evidence):
             raise ValueError("Definite verdict requires repository inspection")
-        if plan and not any(source_read(e) for e in evidence):
+        if plan and not any(application_source_read(e) for e in evidence):
             raise ValueError("Definite verdict requires numbered application source/configuration evidence")
         findings = [c["finding"] for c in data["conditions"]]
         if data["status"] == "AFFECTED" and derive_verdict(data["conditions"], plan) != "AFFECTED":
             raise ValueError("AFFECTED requires every prerequisite proven")
+        if data["status"] == "AFFECTED" and plan and plan.get("component_kind") == "dependency":
+            by_name = {condition["name"]: condition for condition in data["conditions"]}
+            component_ids = set(by_name["component"]["evidence_ids"])
+            version_ids = set(by_name["affected_version"]["evidence_ids"])
+            if not evidence_mentions_component(evidence, plan.get("component", ""), component_ids):
+                raise ValueError("component finding must cite evidence that names the planned dependency")
+            resolved_graph_available = any(item.get("tool") == "resolve_dependencies"
+                                           and item.get("result", {}).get("resolution") == "resolved"
+                                           for item in evidence)
+            resolved_anywhere = resolved_component_versions(evidence, plan.get("component", ""))
+            if resolved_graph_available and not resolved_anywhere:
+                raise ValueError("Planned dependency is not present in the resolved dependency graph")
+            if resolved_anywhere:
+                resolved = resolved_component_versions(evidence, plan.get("component", ""), version_ids)
+                if not resolved:
+                    raise ValueError("affected_version finding must cite resolved-version evidence for the planned component")
+                applicability = [simple_version_matches(version, plan.get("version_condition", ""))
+                                 for version in resolved if version]
+                if applicability and all(value is False for value in applicability):
+                    raise ValueError("Resolved component version is outside the plan's affected range")
+            elif not evidence_mentions_component(evidence, plan.get("component", ""), version_ids):
+                raise ValueError("affected_version finding must cite manifest/source evidence naming the planned dependency when resolution is unavailable")
         if data["status"] == "NOT AFFECTED" and derive_verdict(data["conditions"], plan) != "NOT AFFECTED":
             raise ValueError("NOT AFFECTED requires a disproven prerequisite")
     return data
@@ -204,6 +231,44 @@ def parse_json_response(content, condition_names=None):
             if isinstance(condition, dict) and "holds" in condition:
                 condition["finding"] = {"yes": "proven", "no": "disproven", "unknown": "unknown"}.get(condition.pop("holds"), "invalid")
     return data
+
+
+def downgrade_uncited_findings(data):
+    """Evidence-free yes/no claims are unknown, regardless of model wording."""
+    changed = []
+    if not isinstance(data, dict) or not isinstance(data.get("conditions"), list):
+        return changed
+    for condition in data["conditions"]:
+        if (isinstance(condition, dict) and condition.get("finding") in {"proven", "disproven"}
+                and condition.get("evidence_ids") == []):
+            changed.append(condition.get("name", "unknown"))
+            condition["finding"] = "unknown"
+            explanation = condition.get("explanation", "").rstrip()
+            condition["explanation"] = (explanation + " No direct evidence was cited; treated as unknown.").strip()
+    return changed
+
+
+def normalize_untested_alternatives(data, plan):
+    """One alternative path's evidence cannot disprove different OR paths."""
+    if (not isinstance(data, dict) or not isinstance(data.get("conditions"), list)
+            or not plan or plan.get("trigger_logic") != "any"):
+        return []
+    triggers = [condition for condition in data["conditions"] if condition.get("name", "").startswith("trigger_")]
+    proven_ids = {evidence_id for condition in triggers if condition.get("finding") == "proven"
+                  for evidence_id in condition.get("evidence_ids", [])}
+    if not proven_ids:
+        return []
+    changed = []
+    for condition in triggers:
+        ids = set(condition.get("evidence_ids", []))
+        if condition.get("finding") == "disproven" and ids and ids <= proven_ids:
+            changed.append(condition["name"])
+            condition["finding"] = "unknown"
+            condition["explanation"] = "No distinct evidence tested this alternative attack path; treated as unknown."
+    if changed:
+        data["review_notes"] = ("One alternative attack path is proven. Other listed paths remain unknown because no "
+                                "distinct evidence tested them; trigger_logic=any requires only one proven path for AFFECTED.")
+    return changed
 
 
 def derive_verdict(conditions, plan=None):
@@ -313,6 +378,86 @@ def source_read(item):
     return manifest_ecosystem(path) is None and path.suffix.lower() not in {".md", ".sum", ".lock"} and bool(item["result"].get("lines"))
 
 
+def application_source_read(item):
+    """Require production source/configuration, not only a test definition."""
+    if not source_read(item):
+        return False
+    from pathlib import Path
+    path = Path(item["result"].get("path", item["arguments"].get("path", "")))
+    name = path.name.lower()
+    if "tests" in {part.lower() for part in path.parts}:
+        return False
+    return not (name.endswith("_test.go") or name.startswith("test_") or "_test." in name
+                or ".test." in name or ".spec." in name or re.search(r"test\.(java|kt|cs)$", name))
+
+
+def resolved_component_versions(evidence, component, cited_ids=None):
+    """Return resolved versions only when package identity matches the planned component."""
+    component = component.casefold().strip().strip("/")
+    if not component:
+        return []
+    versions = []
+    for item in evidence:
+        if cited_ids is not None and item.get("id") not in cited_ids:
+            continue
+        result = item.get("result", {})
+        if item.get("tool") != "resolve_dependencies" or result.get("resolution") != "resolved":
+            continue
+        for package in result.get("packages", []):
+            name = str(package.get("package", "")).casefold().strip().strip("/")
+            if component_names_match(component, name):
+                versions.append(package.get("effective_version") or package.get("version"))
+    return versions
+
+
+def component_names_match(component, package):
+    """Match exact names, module/subpackage paths, and short ecosystem names."""
+    component = str(component).casefold().strip().strip("/")
+    package = str(package).casefold().strip().strip("/")
+    if not component or not package:
+        return False
+    return (component == package or package.startswith(component + "/") or component.startswith(package + "/")
+            or package.endswith("/" + component) or component.endswith("/" + package))
+
+
+def evidence_mentions_component(evidence, component, cited_ids):
+    component = component.casefold().strip().strip("/")
+    if not component:
+        return False
+    for item in evidence:
+        if item.get("id") not in cited_ids or "error" in item.get("result", {}):
+            continue
+        if component in json.dumps(item.get("result", {}), ensure_ascii=False).casefold():
+            return True
+    return False
+
+
+def simple_version_matches(version, condition):
+    """Evaluate ordinary numeric release ranges; return None for unsupported version syntax."""
+    match = re.fullmatch(r"v?(\d+)\.(\d+)(?:\.(\d+))?(?:\+incompatible)?", str(version or ""))
+    constraints = re.findall(r"(?<!\w)(>=|<=|>|<|==|=)\s*v?(\d+\.\d+(?:\.\d+)?)", condition or "")
+    if not match or not constraints:
+        return None
+    installed = tuple(int(part or 0) for part in match.groups())
+    comparisons = {">=": lambda a, b: a >= b, "<=": lambda a, b: a <= b,
+                   ">": lambda a, b: a > b, "<": lambda a, b: a < b,
+                   "=": lambda a, b: a == b, "==": lambda a, b: a == b}
+    for operator, boundary_text in constraints:
+        boundary = tuple(int(part) for part in boundary_text.split("."))
+        boundary += (0,) * (3 - len(boundary))
+        if not comparisons[operator](installed, boundary):
+            return False
+    return True
+
+
+def selector_names_other_cve(selector, cve_id):
+    """Reject an explicitly CVE-named test when it names a different CVE."""
+    selector_token = re.sub(r"[^a-z0-9]", "", str(selector).casefold())
+    named = re.search(r"cve\d{8,}", selector_token)
+    expected = re.sub(r"[^a-z0-9]", "", cve_id.casefold())
+    return bool(named and named.group(0) != expected)
+
+
 def model_evidence(evidence):
     """Preserve structured evidence and source lines, rather than cutting JSON in half."""
     results = []
@@ -385,7 +530,7 @@ def run_agent(role, cve, repo, model, emit, draft=None, max_turns=8, plan=None, 
         # Retrieval is deterministic application work. A fresh read, separately
         # logged for this review, lets the model assess source independently even
         # when its first response is prose rather than a tool request.
-        earlier_reads = [e for e in repo.evidence[:own_start] if source_read(e)]
+        earlier_reads = [e for e in repo.evidence[:own_start] if application_source_read(e)]
         seen = set()
         for earlier in earlier_reads:
             path = earlier["result"].get("path", earlier["arguments"].get("path"))
@@ -397,14 +542,21 @@ def run_agent(role, cve, repo, model, emit, draft=None, max_turns=8, plan=None, 
             if len(seen) >= 2:
                 break
     stalled = 0
+    source_no_call_attempts = 0
     empty_searches = 0
     for turn in range(max_turns):
-        own_source = any(source_read(e) for e in repo.evidence[own_start:])
+        own_source = any(application_source_read(e) for e in repo.evidence[own_start:])
         current_tools = tools
-        if not own_source and turn >= max_turns - 2:
-            current_tools = [t for t in tools if t["function"]["name"] in {"read_file", "list_files"}]
+        if not own_source:
+            # Source inspection is a prerequisite, not a suggestion. Do not let
+            # a test result or premature finish bypass inspection of production
+            # source/configuration. Dependency inspection and test discovery are
+            # still available to help the model choose the right source file.
+            blocked_until_source = {"finish_investigation", "run_check", "run_targeted_test", "prepare_environment"}
+            current_tools = [t for t in tools if t["function"]["name"] not in blocked_until_source]
             candidates = [str(f.relative_to(repo.root)) for f in repo.files() if manifest_ecosystem(f) is None and f.suffix not in {".md", ".sum", ".lock"}][:40]
-            messages.append({"role": "user", "content": "Before final assessment, independently read application source with read_file. These are application paths, not downloaded dependency paths: " + json.dumps(candidates)})
+            if turn == 0 or turn >= max_turns - 2:
+                messages.append({"role": "user", "content": "Before tests or final assessment, read production application source/configuration with read_file. A test file alone is insufficient. Candidate application paths: " + json.dumps(candidates)})
         elif empty_searches >= 2:
             current_tools = [t for t in tools if t["function"]["name"] != "search_code"]
             messages.append({"role": "user", "content": "Two application searches had no matches. Switch to search_dependency/read_dependency_file for library internals, read relevant tests, or execute a discovered test. Further application searches are disabled for this stage."})
@@ -418,9 +570,9 @@ def run_agent(role, cve, repo, model, emit, draft=None, max_turns=8, plan=None, 
         if not calls:
             if own_source:
                 break
-            stalled += 1
+            source_no_call_attempts += 1
             emit("validation_error", agent=role, cve=cve["id"], error="Relevant source must be read before assessment")
-            if stalled >= 2:
+            if source_no_call_attempts >= 2:
                 raise ServiceError("No successful source inspection after two attempts")
             messages.append({"role": "user", "content": "Read an application source/configuration file with read_file now. An import search or manifest alone is insufficient."})
             continue
@@ -437,15 +589,30 @@ def run_agent(role, cve, repo, model, emit, draft=None, max_turns=8, plan=None, 
                 args = json.loads(args)
             if not isinstance(args, dict) or name not in allowed:
                 result = {"error": "Tool unavailable in this stage. Read relevant source first or choose a tool currently provided."}
+            elif name == "run_targeted_test" and selector_names_other_cve(args.get("selector", ""), cve["id"]):
+                result = {"error": f"Refusing test selector for a different CVE: {args.get('selector', '')}"}
+                emit("validation_error", agent=role, cve=cve["id"], error=result["error"])
             elif name == "finish_investigation":
                 finished, result = True, {"ready": own_source}
             else:
+                if name == "run_targeted_test":
+                    selected = next((test for test in repo.discover_tests()["tests"]
+                                     if test["ecosystem"] == args.get("ecosystem")
+                                     and test["path"] == args.get("path", ".")
+                                     and test["selector"] == args.get("selector")), None)
+                    if selected and not any(e["tool"] == "read_file" and e["agent"] == role
+                                            and e["result"].get("path") == selected["file"]
+                                            and "error" not in e["result"] for e in repo.evidence):
+                        perform(repo, emit, role, cve["id"], "read_file",
+                                {"path": selected["file"], "start_line": 1, "end_line": 120})
                 item = perform(repo, emit, role, cve["id"], name, args)
                 result = item
                 if name == "search_code" and not item["result"].get("matches"):
                     empty_searches += 1
                 repeated = any(e["tool"] == name and e["arguments"] == args and e["result"] == item["result"] for e in repo.evidence[own_start:-1])
                 progressed = progressed or ("error" not in item["result"] and not repeated)
+                if application_source_read(item):
+                    source_no_call_attempts = 0
             tool_message = {"role": "tool", "tool_name": name, "content": clipped(result, 10000)}
             if call.get("id"):
                 tool_message["tool_call_id"] = call["id"]
@@ -463,19 +630,29 @@ def run_agent(role, cve, repo, model, emit, draft=None, max_turns=8, plan=None, 
             if len(boundaries) >= 2:
                 messages = messages[:2] + messages[boundaries[-1]:]
                 messages.append({"role": "user", "content": "Evidence gathered so far: " + clipped(model_evidence(repo.evidence), 16000)})
-    if not any(source_read(e) for e in repo.evidence[own_start:]):
+    if not any(application_source_read(e) for e in repo.evidence[own_start:]):
         raise ServiceError("Investigation ended without reading application source")
     final_messages = [{"role": "system", "content": SYSTEM + ("\nYou are reviewing independently. Address contradictions and list actionable follow_up_requests, or [] if none." if reviewer else "")},
                       {"role": "user", "content": clipped({"cve": cve, "plan": plan, "draft": draft, "feedback": feedback}, 11000) +
                        "\nCaptured evidence:\n" + evidence_text(repo.evidence, (plan or {}).get("component", ""), 30000) +
                        "\nExecution facts: " + json.dumps(execution_summary(repo)) +
-                       "\nAssess every named plan prerequisite exactly once with holds=yes if that exposure prerequisite is satisfied, no if it is false, unknown if unresolved. component present=yes; version within vulnerable range=yes. A matching vulnerable version must NEVER be labelled no. The application derives the final verdict using common prerequisites and the plan's any/all attack-path logic. Cite real evidence IDs. A generic test PASS is not proof; inspect the specific assertions, traces and input. Use UNCERTAIN only with concrete missing facts. Keep each explanation under 45 words and summary under 100 words."}]
+                       "\nAssess every named plan prerequisite exactly once with holds=yes if that exposure prerequisite is satisfied, no if it is false, unknown if unresolved. component present=yes; version within vulnerable range=yes. A matching vulnerable version must NEVER be labelled no. For trigger_logic=any, one proven attack path is sufficient; untested alternatives are unknown, never no, and do not make the verdict uncertain. The application derives the final verdict using common prerequisites and the plan's any/all attack-path logic. Cite real evidence IDs. A generic test PASS is not proof; inspect the specific assertions, traces and input. Use UNCERTAIN only with concrete missing facts. Keep each explanation under 45 words and summary under 100 words."}]
     last_error = ""
     for attempt in range(2):
         message = call_model(model, final_messages, emit, role, cve["id"], "assessment", schema=assessment_schema(names, reviewer))
         try:
             parsed = parse_json_response(message.get("content", ""), names)
             parsed = set_execution_facts(parsed, repo.evidence)
+            downgraded = downgrade_uncited_findings(parsed)
+            if downgraded:
+                emit("assessment_normalized", agent=role, cve=cve["id"],
+                     conditions=downgraded,
+                     reason="Evidence-free definite findings were treated as unknown")
+            alternatives = normalize_untested_alternatives(parsed, plan)
+            if alternatives:
+                emit("assessment_normalized", agent=role, cve=cve["id"],
+                     conditions=alternatives,
+                     reason="Evidence from one proven OR path cannot disprove untested alternatives")
             if isinstance(parsed, dict) and isinstance(parsed.get("conditions"), list):
                 parsed["status"] = derive_verdict(parsed["conditions"], plan)
             data = validate_assessment(parsed, repo.evidence, names, plan)
@@ -528,7 +705,10 @@ def investigate(cve, repo, model, emit, max_turns=8):
                     requests.append("Read the existing test assertions and execute a discovered selector or configured check: " + json.dumps({"tests": discovered[:8], "checks": repo.available_checks()}))
                 if plan["component_kind"] == "dependency" and not any(e["tool"] == "read_dependency_file" and "error" not in e["result"] for e in repo.evidence):
                     requests.append("Use search_dependency to locate the advisory's internal symbol in the resolved package, then read_dependency_file using its exact returned path and lines.")
-            if requests:
+            # Follow-up is decision-relevant only while the derived verdict is
+            # uncertain. With OR attack paths, unknown alternatives do not undo
+            # one proven path and should not trigger another investigation round.
+            if final["status"] == "UNCERTAIN" and requests:
                 emit("review_follow_up", cve=cve["id"], requests=requests)
                 follow_up = run_agent("investigator_followup", cve, repo, model, emit, draft=draft,
                                       max_turns=min(max_turns, 4), plan=plan, feedback=requests)

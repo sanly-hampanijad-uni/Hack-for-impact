@@ -7,7 +7,8 @@ import unittest
 from unittest.mock import patch
 
 from spark_cve.agents import (create_plan, derive_verdict, investigate, parse_json_response,
-                              uncertain, validate_assessment, assessment_schema, evidence_text, run_agent, call_model)
+                              uncertain, validate_assessment, assessment_schema, evidence_text, run_agent, call_model,
+                              simple_version_matches, downgrade_uncited_findings, component_names_match)
 from spark_cve.clients import ServiceError
 from spark_cve.tools import Repository
 from spark_cve.ecosystems import parse_manifest
@@ -26,6 +27,119 @@ def findings(*values):
 
 
 class VerdictTests(unittest.TestCase):
+    def test_one_or_path_cannot_disprove_others_with_the_same_evidence(self):
+        data = {"review_notes": "Other triggers are disproven.", "conditions": [
+            {"name": "trigger_1", "finding": "proven", "explanation": "observed", "evidence_ids": ["E1"]},
+            {"name": "trigger_2", "finding": "disproven", "explanation": "not seen", "evidence_ids": ["E1"]},
+            {"name": "trigger_3", "finding": "disproven", "explanation": "separately tested", "evidence_ids": ["E2"]},
+        ]}
+        from spark_cve.agents import normalize_untested_alternatives
+        self.assertEqual(normalize_untested_alternatives(data, {"trigger_logic": "any"}), ["trigger_2"])
+        self.assertEqual(data["conditions"][1]["finding"], "unknown")
+        self.assertEqual(data["conditions"][2]["finding"], "disproven")
+        self.assertIn("requires only one proven path", data["review_notes"])
+
+    def test_component_identity_supports_ecosystem_names_and_subpackages(self):
+        self.assertTrue(component_names_match("kin-openapi", "github.com/getkin/kin-openapi"))
+        self.assertTrue(component_names_match("github.com/getkin/kin-openapi/openapi3filter",
+                                              "github.com/getkin/kin-openapi"))
+        self.assertTrue(component_names_match("@scope/widget", "@scope/widget"))
+        self.assertFalse(component_names_match("attested-tls-poc", "github.com/getkin/kin-openapi"))
+
+    def test_application_cve_does_not_require_dependency_resolution(self):
+        application_plan = {
+            "component": "local parser", "component_kind": "application", "version_condition": "affected revision",
+            "trigger_logic": "all", "conditions": [{"name": name} for name in
+                                                      ("component", "affected_version", "trigger_1")],
+        }
+        evidence = [{"id": "E1", "agent": "investigator", "tool": "read_file",
+                     "arguments": {"path": "app.py"},
+                     "result": {"path": "app.py", "lines": ["1: def parse(value): return value[0]"]}}]
+        data = uncertain("none")
+        data.update({"status": "AFFECTED", "missing_information": [],
+                     "conditions": [{"name": name, "finding": "proven", "explanation": "verified",
+                                      "evidence_ids": ["E1"]}
+                                    for name in ("component", "affected_version", "trigger_1")]})
+        names = ["component", "affected_version", "trigger_1"]
+        self.assertEqual(validate_assessment(data, evidence, names, application_plan)["status"], "AFFECTED")
+
+    def test_dependency_cve_can_use_manifest_evidence_when_resolver_is_unavailable(self):
+        dependency_plan = {
+            "component": "org.example:widget", "component_kind": "dependency", "version_condition": "< 2.0.0",
+            "trigger_logic": "all", "conditions": [{"name": name} for name in
+                                                      ("component", "affected_version", "trigger_1")],
+        }
+        evidence = [
+            {"id": "E1", "agent": "application", "tool": "inspect_dependencies", "arguments": {},
+             "result": {"resolution": "unresolved", "manifests": [{"declared_requirements": [
+                 {"package": "org.example:widget", "version": "1.5.0"}]}]}},
+            {"id": "E2", "agent": "investigator", "tool": "read_file", "arguments": {"path": "App.java"},
+             "result": {"path": "App.java", "lines": ["1: import org.example.widget.Parser;"]}},
+        ]
+        data = uncertain("none")
+        data.update({"status": "AFFECTED", "missing_information": [],
+                     "conditions": [
+                         {"name": "component", "finding": "proven", "explanation": "present", "evidence_ids": ["E1"]},
+                         {"name": "affected_version", "finding": "proven", "explanation": "declared", "evidence_ids": ["E1"]},
+                         {"name": "trigger_1", "finding": "proven", "explanation": "reachable", "evidence_ids": ["E2"]},
+                     ]})
+        names = ["component", "affected_version", "trigger_1"]
+        self.assertEqual(validate_assessment(data, evidence, names, dependency_plan)["status"], "AFFECTED")
+
+    def test_uncited_definite_findings_are_conservatively_unknown(self):
+        data = {"conditions": [
+            {"name": "trigger_1", "finding": "proven", "explanation": "observed", "evidence_ids": ["E1"]},
+            {"name": "trigger_2", "finding": "disproven", "explanation": "not tested", "evidence_ids": []},
+        ]}
+        self.assertEqual(downgrade_uncited_findings(data), ["trigger_2"])
+        self.assertEqual(data["conditions"][1]["finding"], "unknown")
+        self.assertIn("No direct evidence", data["conditions"][1]["explanation"])
+
+    def test_simple_version_range(self):
+        self.assertTrue(simple_version_matches("v0.144.0", ">= 0.136.0 && < 0.149.0"))
+        self.assertFalse(simple_version_matches("v0.149.0", ">= 0.136.0 && < 0.149.0"))
+        self.assertIsNone(simple_version_matches("main", ">= 0.136.0 && < 0.149.0"))
+
+    def test_affected_dependency_must_match_plan_identity_and_version(self):
+        dependency_plan = {
+            "component": "kin-openapi", "component_kind": "dependency",
+            "version_condition": ">= 0.136.0 && < 0.149.0", "trigger_logic": "any",
+            "conditions": [{"name": name} for name in ("component", "affected_version", "trigger_1")],
+        }
+        evidence = [
+            {"id": "E1", "agent": "application", "tool": "resolve_dependencies", "arguments": {},
+             "result": {"resolution": "resolved", "packages": [{"package": "github.com/getkin/kin-openapi",
+                                                                    "version": "v0.144.0", "effective_version": "v0.144.0"}]}},
+            {"id": "E2", "agent": "investigator", "tool": "read_file", "arguments": {"path": "main.go"},
+             "result": {"path": "main.go", "lines": ["1: package main"]}},
+        ]
+        data = uncertain("none")
+        data.update({"status": "AFFECTED", "missing_information": [],
+                     "conditions": [{"name": name, "finding": "proven", "explanation": "verified",
+                                      "evidence_ids": ["E1", "E2"]}
+                                    for name in ("component", "affected_version", "trigger_1")]})
+        condition_names = ["component", "affected_version", "trigger_1"]
+        self.assertEqual(validate_assessment(data, evidence, condition_names, dependency_plan)["status"], "AFFECTED")
+        contradictory = json.loads(json.dumps(data))
+        contradictory["summary"] = "The status remains UNCERTAIN despite the proven path."
+        with self.assertRaisesRegex(ValueError, "Narrative contradicts derived AFFECTED"):
+            validate_assessment(contradictory, evidence, condition_names, dependency_plan)
+        bad_component_citation = json.loads(json.dumps(data))
+        bad_component_citation["conditions"][0]["evidence_ids"] = ["E2"]
+        with self.assertRaisesRegex(ValueError, "component finding must cite"):
+            validate_assessment(bad_component_citation, evidence, condition_names, dependency_plan)
+        bad_version_citation = json.loads(json.dumps(data))
+        bad_version_citation["conditions"][1]["evidence_ids"] = ["E2"]
+        with self.assertRaisesRegex(ValueError, "affected_version finding must cite"):
+            validate_assessment(bad_version_citation, evidence, condition_names, dependency_plan)
+        unrelated = {**dependency_plan, "component": "attested-tls-poc"}
+        with self.assertRaisesRegex(ValueError, "planned dependency"):
+            validate_assessment(data, evidence, condition_names, unrelated)
+        fixed = json.loads(json.dumps(evidence))
+        fixed[0]["result"]["packages"][0].update({"version": "v0.149.0", "effective_version": "v0.149.0"})
+        with self.assertRaisesRegex(ValueError, "outside.*affected range"):
+            validate_assessment(data, fixed, condition_names, dependency_plan)
+
     def test_failed_tool_is_coverage_evidence_only(self):
         evidence = [{"id": "E8", "tool": "read_dependency_file", "result": {"error": "missing package"}}]
         data = uncertain("Dependency source unavailable")
@@ -191,6 +305,84 @@ class CrossStackTests(unittest.TestCase):
 
 
 class FollowUpTests(unittest.TestCase):
+    def test_source_is_required_before_tests_or_finish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "go.mod").write_text("module example.test/app\ngo 1.23\n")
+            (root / "main.go").write_text("package main\nfunc main() {}\n")
+            (root / "main_test.go").write_text("package main\nfunc TestExample(t *testing.T) {}\n")
+            repo = Repository(root, allow_execution=True)
+            names = [condition["name"] for condition in plan()["conditions"]]
+            assessment = uncertain("No definite conclusion")
+            assessment["conditions"] = {name: {"holds": "unknown", "explanation": "not assessed", "evidence_ids": []}
+                                         for name in names}
+            class Model:
+                calls = 0
+                def chat(self, *args, **kwargs):
+                    available = {tool["function"]["name"] for tool in kwargs.get("tools", [])}
+                    if self.calls == 0:
+                        self.calls += 1
+                        self.assert_gated(available)
+                        return {"role": "assistant", "content": "", "tool_calls": [
+                            {"function": {"name": "discover_tests", "arguments": {}}}]}
+                    if self.calls == 1:
+                        self.calls += 1
+                        self.assert_gated(available)
+                        return {"role": "assistant", "content": "", "tool_calls": [
+                            {"function": {"name": "read_file", "arguments": {"path": "main.go"}}}]}
+                    if self.calls == 2:
+                        self.calls += 1
+                        if "finish_investigation" not in available or "run_targeted_test" not in available:
+                            raise AssertionError("finish and execution should be available after production source")
+                        return {"role": "assistant", "content": "", "tool_calls": [
+                            {"function": {"name": "finish_investigation", "arguments": {}}}]}
+                    self.calls += 1
+                    return {"role": "assistant", "content": json.dumps(assessment)}
+
+                @staticmethod
+                def assert_gated(available):
+                    if "finish_investigation" in available or "run_targeted_test" in available:
+                        raise AssertionError("finish and execution must be gated until production source is read")
+            try:
+                result = run_agent("investigator", {"id": "CVE-2026-100353"}, repo, Model(),
+                                   lambda *args, **kwargs: None, plan=plan())
+                self.assertEqual(result["status"], "UNCERTAIN")
+                self.assertEqual([item["tool"] for item in repo.evidence], ["discover_tests", "read_file"])
+            finally:
+                repo.close()
+
+    def test_targeted_test_named_for_another_cve_is_not_executed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "go.mod").write_text("module example.test/app\ngo 1.23\n")
+            (root / "main.go").write_text("package main\nfunc main() {}\n")
+            (root / "main_test.go").write_text("package main\nfunc TestCVE2026100353Reproduces(t *testing.T) {}\n")
+            repo = Repository(root, allow_execution=True)
+            names = [condition["name"] for condition in plan()["conditions"]]
+            assessment = uncertain("Wrong-CVE test rejected")
+            assessment["conditions"] = {name: {"holds": "unknown", "explanation": "not assessed", "evidence_ids": []}
+                                         for name in names}
+            responses = [
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"function": {"name": "read_file", "arguments": {"path": "main.go"}}}]},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"function": {"name": "run_targeted_test", "arguments": {
+                        "ecosystem": "go", "selector": "TestCVE2026100353Reproduces", "path": "."}}}]},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"function": {"name": "finish_investigation", "arguments": {}}}]},
+                {"role": "assistant", "content": json.dumps(assessment)},
+            ]
+            class Model:
+                def chat(self, *args, **kwargs):
+                    return responses.pop(0)
+            try:
+                result = run_agent("investigator", {"id": "CVE-2026-129092"}, repo, Model(),
+                                   lambda *args, **kwargs: None, plan=plan())
+                self.assertEqual(result["status"], "UNCERTAIN")
+                self.assertFalse(any(item["tool"] == "run_targeted_test" for item in repo.evidence))
+            finally:
+                repo.close()
+
     def test_transient_model_error_gets_one_retry(self):
         class Model:
             calls = 0
