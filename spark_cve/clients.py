@@ -9,9 +9,10 @@ from urllib.request import Request, urlopen
 
 
 class ServiceError(RuntimeError):
-    def __init__(self, message, status=None):
+    def __init__(self, message, status=None, retryable=False):
         super().__init__(message)
         self.status = status
+        self.retryable = retryable
 
 
 def request_json(url, *, payload=None, headers=None, timeout=120):
@@ -23,8 +24,12 @@ def request_json(url, *, payload=None, headers=None, timeout=120):
     except HTTPError as exc:
         # Do not expose response bodies, headers, or credentials in diagnostics.
         raise ServiceError(f"HTTP {exc.code} from {urlparse(url).hostname}", status=exc.code) from None
-    except (URLError, TimeoutError, OSError, ValueError) as exc:
-        raise ServiceError(f"Request to {urlparse(url).hostname} failed ({type(exc).__name__})") from None
+    except (URLError, TimeoutError, OSError) as exc:
+        timed_out = isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError)
+        detail = f"timed out (timeout setting: {timeout}s)" if timed_out else f"failed ({type(exc).__name__})"
+        raise ServiceError(f"Request to {urlparse(url).hostname} {detail}", retryable=True) from None
+    except ValueError:
+        raise ServiceError(f"Invalid JSON returned by {urlparse(url).hostname}") from None
 
 
 def normalize_cve(record):
@@ -52,9 +57,11 @@ def normalize_cve(record):
 class NVD:
     endpoint = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
-    def __init__(self, key=None, transport=request_json, sleep=time.sleep):
+    def __init__(self, key=None, transport=request_json, sleep=time.sleep, timeout=45, progress=None):
         self.key, self.transport, self.sleep = key, transport, sleep
         self.last_request = None
+        self.timeout = timeout
+        self.progress = progress or (lambda kind, **data: None)
 
     def fetch(self, **params):
         interval = 0.7 if self.key else 6.1
@@ -62,13 +69,22 @@ class NVD:
             if self.last_request is not None:
                 self.sleep(max(0, interval - (time.monotonic() - self.last_request)))
             self.last_request = time.monotonic()
+            self.progress("nvd_request", attempt=attempt + 1, max_attempts=3,
+                          timeout_seconds=self.timeout, query=params)
+            started = time.monotonic()
             try:
-                return self.transport(self.endpoint + "?" + urlencode(params),
-                                      headers={"apiKey": self.key} if self.key else {}, timeout=45)
+                result = self.transport(self.endpoint + "?" + urlencode(params),
+                                        headers={"apiKey": self.key} if self.key else {}, timeout=self.timeout)
+                self.progress("nvd_response", elapsed_seconds=round(time.monotonic() - started, 2),
+                              records=len(result.get("vulnerabilities", [])))
+                return result
             except ServiceError as exc:
-                if exc.status not in {429, 500, 502, 503, 504} or attempt == 2:
+                retryable = exc.retryable or exc.status in {429, 500, 502, 503, 504}
+                if not retryable or attempt == 2:
                     raise
-                self.sleep(2 ** attempt)
+                delay = max(interval, 2 ** attempt)
+                self.progress("nvd_retry", attempt=attempt + 1, delay_seconds=delay, error=str(exc))
+                self.sleep(delay)
 
     def get(self, cve_id):
         if not re.fullmatch(r"CVE-\d{4}-\d{4,}", cve_id):
@@ -88,13 +104,13 @@ class NVD:
         found = {}
         searched = 0
         while searched < lookback_days:
-            days = min(3, lookback_days - searched)
+            days = min(1, lookback_days - searched)
             start = end - timedelta(days=days)
             index = 0
             while True:
                 page = self.fetch(pubStartDate=start.isoformat(timespec="milliseconds"),
                                   pubEndDate=end.isoformat(timespec="milliseconds"),
-                                  resultsPerPage=2000, startIndex=index)
+                                  resultsPerPage=100, startIndex=index)
                 rows = page.get("vulnerabilities", [])
                 for row in rows:
                     cve = normalize_cve(row["cve"])
@@ -121,20 +137,39 @@ class Ollama:
         if "cloud" in model.lower():
             raise ValueError("Select a locally installed model, not an Ollama cloud model")
         self.url, self.model, self.transport, self.timeout = base_url.rstrip("/"), model, transport, timeout
+        self.last_metrics = {}
 
     def models(self):
         return self.transport(self.url + "/api/tags", timeout=10)
 
-    def chat(self, messages, tools=None, schema=None):
+    def chat(self, messages, tools=None, schema=None, max_tokens=None):
         payload = {"model": self.model, "messages": messages, "stream": False,
                    "think": False, "keep_alive": "30m",
-                   "options": {"num_ctx": 8192, "num_predict": 2048, "temperature": 0}}
+                   "options": {"num_ctx": 8192, "num_predict": max_tokens or (2048 if schema else 512), "temperature": 0}}
         if tools:
             payload["tools"] = tools
         if schema:
             payload["format"] = schema
         response = self.transport(self.url + "/api/chat", payload=payload, timeout=self.timeout)
+        self.last_metrics = {key: response.get(key) for key in (
+            "done_reason", "total_duration", "load_duration", "prompt_eval_count",
+            "prompt_eval_duration", "eval_count", "eval_duration")}
         if not isinstance(response.get("message"), dict):
             raise ServiceError("Ollama returned no message")
         # Only retain public content/tool requests, never hidden thinking traces.
         return {k: v for k, v in response["message"].items() if k in {"role", "content", "tool_calls"}}
+
+    def probe_tools(self):
+        """One synthetic request: verifies parsed tool selection without reading user source."""
+        from .tools import TOOLS
+        message = self.chat([{"role": "user", "content": "Call inspect_dependencies now. Do not write an assessment."}],
+                            tools=[next(t for t in TOOLS if t["function"]["name"] == "inspect_dependencies")], max_tokens=256)
+        calls = message.get("tool_calls", [])
+        if not isinstance(calls, list) or not calls or not all(
+            isinstance(c, dict) and isinstance(c.get("function"), dict)
+            and c["function"].get("name") == "inspect_dependencies"
+            and c["function"].get("arguments", {}) in ({}, "{}") for c in calls):
+            raise ServiceError("Model tool-call preflight failed: no valid inspect_dependencies call. "
+                               f"Response characters={len(message.get('content', ''))}; "
+                               f"done_reason={self.last_metrics.get('done_reason')}. Batch not started.")
+        return {"tool": "inspect_dependencies", "metrics": self.last_metrics}

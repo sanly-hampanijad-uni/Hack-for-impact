@@ -48,8 +48,9 @@ python3 -m spark_cve doctor
 ```
 
 Default model: `nemotron-3-nano:30b`. Have the Spark operator load that model if
-missing. A successful doctor checks connectivity and model listing, not GPU
-placement or tool-call correctness. Verify GPU use on Spark with its operator
+missing. Doctor checks connectivity, model listing, and a real synthetic tool-call
+request (without sending source). It does not establish GPU placement or evidence
+quality. Verify GPU use on Spark with its operator
 before making that claim in the demonstration.
 
 Retrieve recent CVEs without analysing source:
@@ -63,7 +64,7 @@ in the process environment. Never commit keys; rotate any key shared in chat.
 Requests also work without a key, with slower rate limiting. No offline fallback
 is used: service failure stops retrieval with a nonzero exit code.
 
-Investigate the latest 10 scored HIGH/CRITICAL CVEs:
+Investigate the latest **2** scored HIGH/CRITICAL CVEs (the testing default):
 
 ```bash
 python3 -m spark_cve scan /absolute/path/to/go-repository --prompt-key
@@ -83,10 +84,18 @@ python3 -m spark_cve scan /absolute/path/to/go-repository --limit 1 --max-turns 
 python3 -m spark_cve scan --help
 ```
 
-Global options (`--model`, `--ollama-url`) precede the subcommand. Model transport
-accepts loopback HTTP endpoints only. Each agent has a bounded tool-turn budget
-and two final JSON attempts. Each HTTP inference call has a 180-second timeout;
+Add `--limit 10` to restore the full ten-CVE batch. Global options (`--model`,
+`--ollama-url`) precede the subcommand. Model transport accepts loopback HTTP
+endpoints only. Each agent gets six investigation turns by default, followed by
+up to two structured assessment attempts. The verdict schema is supplied only
+after evidence collection. Each HTTP inference call has a 180-second timeout;
 batch analysis can take substantially longer than a five-minute presentation.
+
+A synthetic tool-call preflight runs once before NVD retrieval. Repeated missing
+tool calls or failed tool operations stop the investigation after two turns of no
+progress. A failed investigator skips review; an operational analysis failure
+stops the remaining batch with a nonzero exit code and preserves its report.
+A valid UNCERTAIN assessment still receives review and permits the batch to continue.
 
 ### Optional Go execution
 
@@ -125,6 +134,10 @@ Each scan creates a new private `artifacts/<timestamp>/` directory containing:
 
 Artifacts contain source excerpts; treat them as private. The entire artifacts
 directory is ignored by Git. Reports are saved after each completed CVE.
+Model events now include phase, elapsed time, completion reason, token/timing
+metrics and a bounded public response preview. Validation errors are visible in
+the terminal and event file. `analysis_error` and `review_state` distinguish a
+failed run from a completed UNCERTAIN assessment. Private reasoning is excluded.
 
 - **AFFECTED:** every prerequisite is marked proven with valid evidence references.
 - **NOT AFFECTED:** at least one necessary prerequisite is disproven with evidence.
@@ -143,12 +156,19 @@ suggested diffs. Generic Go tests cannot be labelled a successful CVE reproducti
 
 ### NVD selection policy
 
-The client fully paginates three-day publication windows, searches backwards up
+The client fully paginates one-day publication windows (100 records per request), searches backwards up
 to 30 days by default, chooses HIGH/CRITICAL records, sorts by publication time
-descending, and takes 10. When 10 matches have been found, older windows cannot
+descending, and takes the requested count (2 by default, up to 10). Once enough matches have been found, older windows cannot
 displace those matches. If fewer are found, the CLI states the bounded search
 interval; `--lookback-days` supports up to 120 days. Unscored and rejected records
 are excluded. New disclosures without scores therefore do not appear immediately.
+
+NVD requests retry transient HTTP errors and network timeouts up to three total
+attempts, with visible request/retry events. Authentication errors are not retried.
+The timeout defaults to 45 seconds per attempt; use `--nvd-timeout 90` if the live
+service is slow. Three timed-out attempts at that setting can take over four
+minutes including backoff. Smaller pages reduce response size but cannot fix an
+unavailable NVD service. Retrieval still stops without an offline fallback.
 
 Score policy: CVSS 4.0 first, then 3.1, then 3.0; prefer the Primary source within
 that version, otherwise the first available source. Preserve the selected score

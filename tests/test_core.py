@@ -6,7 +6,8 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
-from spark_cve.agents import CONDITIONS, investigate, uncertain, validate_assessment
+from spark_cve.agents import CONDITIONS, investigate, uncertain, validate_assessment, parse_json_response
+from spark_cve.cli import parser
 from spark_cve.clients import NVD, Ollama, ServiceError, normalize_cve
 from spark_cve.reporting import write_reports
 from spark_cve.tools import Repository
@@ -89,6 +90,39 @@ class RepositoryTests(unittest.TestCase):
 
 
 class NVDTests(unittest.TestCase):
+    def test_network_timeout_retried_with_progress_and_configured_timeout(self):
+        calls, events = [], []
+        def transport(url, **kwargs):
+            calls.append(kwargs)
+            if len(calls) < 3:
+                raise ServiceError("timed out", retryable=True)
+            return {"vulnerabilities": [{"cve": record()}]}
+        nvd = NVD("test-key", transport=transport, sleep=lambda _: None, timeout=90,
+                  progress=lambda kind, **data: events.append((kind, data)))
+        self.assertEqual(nvd.get("CVE-2026-12345")["id"], "CVE-2026-12345")
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(c["timeout"] == 90 for c in calls))
+        self.assertEqual(sum(kind == "nvd_retry" for kind, _ in events), 2)
+        self.assertNotIn("test-key", json.dumps(events))
+
+    def test_timeouts_eventually_fail_without_fallback(self):
+        calls = []
+        def transport(*args, **kwargs):
+            calls.append(1)
+            raise ServiceError("timed out", retryable=True)
+        with self.assertRaisesRegex(ServiceError, "timed out"):
+            NVD(transport=transport, sleep=lambda _: None).recent(2)
+        self.assertEqual(len(calls), 3)
+
+    def test_unauthorized_not_retried(self):
+        calls = []
+        def transport(*args, **kwargs):
+            calls.append(1)
+            raise ServiceError("HTTP 403", status=403)
+        with self.assertRaises(ServiceError):
+            NVD(transport=transport, sleep=lambda _: None).recent(2)
+        self.assertEqual(len(calls), 1)
+
     def test_transient_errors_retry_but_permanent_errors_do_not(self):
         attempts = []
         def flaky(url, **kwargs):
@@ -103,6 +137,7 @@ class NVDTests(unittest.TestCase):
         calls = []
         def transport(url, **kwargs):
             params = parse_qs(urlparse(url).query)
+            self.assertEqual(params["resultsPerPage"], ["100"])
             index = int(params["startIndex"][0])
             calls.append(index)
             rows = [record("CVE-2026-10001", "2026-11-12T01:00:00.000"),
@@ -135,6 +170,78 @@ class NVDTests(unittest.TestCase):
 
 
 class AgentTests(unittest.TestCase):
+    def test_keyed_conditions_normalize_without_duplicates(self):
+        data = answer([])
+        data["conditions"] = {c["name"]: {k: v for k, v in c.items() if k != "name"} for c in data["conditions"]}
+        result = parse_json_response(json.dumps(data))
+        self.assertEqual([c["name"] for c in result["conditions"]], CONDITIONS)
+        validate_assessment(result, [])
+        with self.assertRaisesRegex(ValueError, "Duplicate JSON key"):
+            parse_json_response('{"status":"UNCERTAIN", "status":"AFFECTED"}')
+
+    def test_testing_defaults(self):
+        args = parser().parse_args(["scan", "."])
+        self.assertEqual(args.limit, 2)
+        self.assertEqual(args.max_turns, 6)
+
+    def test_no_tool_calls_stop_after_two_attempts_and_skip_review(self):
+        with tempfile.TemporaryDirectory() as root:
+            class NonAgentModel:
+                model = "test"
+                count = 0
+                def chat(self, *args, **kwargs):
+                    self.count += 1
+                    return {"role": "assistant", "content": "I cannot access source"}
+            model = NonAgentModel()
+            events = []
+            result = investigate(normalize_cve(record()), Repository(root), model, lambda kind, **kw: events.append(kind))
+            self.assertEqual(model.count, 2)
+            self.assertEqual(result["review_state"], "skipped")
+            self.assertIn("No structured tool calls", result["analysis_error"])
+            self.assertEqual(events.count("validation_error"), 2)
+            self.assertIn("review_skipped", events)
+
+    def test_failed_tool_calls_stop_without_review(self):
+        with tempfile.TemporaryDirectory() as root:
+            class BadToolModel:
+                model = "test"
+                count = 0
+                def chat(self, *args, **kwargs):
+                    self.count += 1
+                    return {"role": "assistant", "content": "", "tool_calls": [
+                        {"function": {"name": "read_file", "arguments": {"path": "missing.go"}}}]}
+            model = BadToolModel()
+            result = investigate(normalize_cve(record()), Repository(root), model, lambda *a, **k: None)
+            self.assertEqual(model.count, 2)
+            self.assertEqual(result["review_state"], "skipped")
+            self.assertEqual(len(result["evidence"]), 2)
+
+    def test_repeated_identical_successful_tool_calls_are_not_progress(self):
+        with tempfile.TemporaryDirectory() as root:
+            class RepeatingModel:
+                model = "test"
+                count = 0
+                def chat(self, *args, **kwargs):
+                    self.count += 1
+                    return {"role": "assistant", "content": "", "tool_calls": [
+                        {"function": {"name": "inspect_dependencies", "arguments": {}}}]}
+            model = RepeatingModel()
+            result = investigate(normalize_cve(record()), Repository(root), model, lambda *a, **k: None)
+            self.assertEqual(model.count, 3)
+            self.assertEqual(result["review_state"], "skipped")
+
+    def test_preflight_requires_parsed_tool_calls_and_preserves_metrics(self):
+        def good(url, **kw):
+            return {"message": {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "inspect_dependencies", "arguments": {}}}]},
+                "done_reason": "stop", "eval_count": 17}
+        model = Ollama(transport=good)
+        self.assertEqual(model.probe_tools()["metrics"]["eval_count"], 17)
+        def bad(url, **kw):
+            return {"message": {"role": "assistant", "content": "inspect_dependencies()"}, "done_reason": "length"}
+        with self.assertRaisesRegex(ServiceError, "preflight failed"):
+            Ollama(transport=bad).probe_tools()
+
     def test_evidence_gates(self):
         evidence = [{"id": "E1", "tool": "read_file", "result": {"lines": ["1: example"]}}]
         data = answer(["E1"], "AFFECTED")
@@ -168,8 +275,10 @@ class AgentTests(unittest.TestCase):
             repo = Repository(root)
             messages = [
                 {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "inspect_dependencies", "arguments": {}}}]},
+                {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "finish_investigation", "arguments": {}}}]},
                 {"role": "assistant", "content": json.dumps(answer(["E1"]))},
                 {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "go.mod"}}}]},
+                {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "finish_investigation", "arguments": {}}}]},
                 {"role": "assistant", "content": json.dumps(answer(["E2"]))},
             ]
             class ScriptedModel:

@@ -13,6 +13,16 @@ class Events:
         with self.path.open("a") as handle:
             handle.write(json.dumps(event, ensure_ascii=False) + "\n")
         label = " / ".join(str(data[k]) for k in ("cve", "agent", "tool", "evidence_id", "status") if k in data)
+        if kind == "model_response":
+            label += f" / {data['phase']} / {data['elapsed_seconds']}s / {data.get('metrics', {}).get('done_reason')}"
+        if kind == "nvd_request":
+            label += f"attempt {data['attempt']}/{data['max_attempts']} / timeout {data['timeout_seconds']}s / page offset {data['query'].get('startIndex', 0)}"
+        if kind == "nvd_response":
+            label += f"{data['records']} records / {data['elapsed_seconds']}s"
+        if kind == "nvd_retry":
+            label += f"retry in {data['delay_seconds']}s"
+        if data.get("error"):
+            label += " / " + str(data["error"])[:300]
         print(f"[{event['time'][11:19]}] {kind}: {label}", file=sys.stderr, flush=True)
 
 
@@ -27,10 +37,13 @@ def markdown(results):
                   f"Score source: {cve['score_source']} | Published: {cve['published']} | Retrieved: {cve['retrieved_at']}",
                   f"Model: `{result['model']}` | Source snapshot SHA-256: `{result['snapshot']}`", "",
                   "### Assessment", "", assessment["summary"], "", "### Prerequisites", ""]
+        if result.get("analysis_error"):
+            lines += ["**Analysis failed:** " + result["analysis_error"],
+                      "This UNCERTAIN result reflects an execution failure, not a completed security investigation.", ""]
         for condition in assessment["conditions"]:
             lines += [f"- **{condition['name']}: {condition['finding']}** — {condition['explanation']} "
                       f"({', '.join(condition['evidence_ids']) or 'no evidence'})"]
-        lines += ["", "### Independent review", "", assessment["review_notes"], "",
+        lines += ["", "### Independent review", "", f"Review state: {result.get('review_state', 'completed')}", "", assessment["review_notes"], "",
                   f"Investigator verdict: {result['investigator']['status']}", "", "### Missing information", ""]
         lines += [f"- {item}" for item in assessment["missing_information"]] or ["- None reported."]
         lines += ["", "### Remediation", "", assessment["remediation"], "", "### Local reproduction", "",
