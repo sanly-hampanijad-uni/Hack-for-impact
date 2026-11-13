@@ -61,6 +61,14 @@ setup() {
     success "setup complete."
 }
 
+tunnel() {
+    "Starting the tunnel..."
+
+    ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:11435:127.0.0.1:${DGX_PORT} ${DGX_HOST}
+
+    success "Tunnel established."
+}
+
 # Vulnerability scan
 scan() {
     local CVE=""
@@ -149,6 +157,7 @@ scan() {
 
 main() {
     setup
+    tunnel
     scan "$@"
 }
 
