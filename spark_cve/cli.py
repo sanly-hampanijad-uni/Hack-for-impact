@@ -7,9 +7,10 @@ from pathlib import Path
 import sys
 
 from .agents import investigate
+from .attack_surface import analyze_attack_surface
 from .clients import NVD, Ollama, ServiceError
-from .reporting import Events, write_reports
-from .tools import Repository
+from .reporting import Events, write_attack_surface_reports, write_reports
+from .tools import ATTACK_SURFACE_SUFFIXES, Repository
 
 
 def parser():
@@ -31,6 +32,10 @@ def parser():
     scan.add_argument("--allow-execution", action="store_true", help="Allow fixed Go checks in restricted Docker containers")
     scan.add_argument("--allow-downloads", action="store_true", help="Give check containers network access for Go dependency retrieval")
     scan.add_argument("--go-image", default="golang:1.24", help="Preloaded Docker image appropriate to repository Go version")
+    surface = sub.add_parser("attack-surface", help="Report source-supported attack vectors in a local application")
+    surface.add_argument("repository", type=Path)
+    surface.add_argument("--output", type=Path, help="New output directory (defaults to artifacts/<timestamp>)")
+    surface.add_argument("--max-turns", type=int, default=10, help="Tool turns, plus two final JSON attempts")
     return root
 
 
@@ -45,6 +50,22 @@ def main(argv=None):
                 print("Requested model is not installed. Have the Spark operator load it locally.", file=sys.stderr)
                 return 1
             print("Ollama is reachable and the model is listed. A scan must still verify real tool calling.")
+            return 0
+        if args.command == "attack-surface":
+            if not 1 <= args.max_turns <= 30:
+                raise ValueError("max-turns must be 1–30")
+            repo = Repository(args.repository, source_suffixes=ATTACK_SURFACE_SUFFIXES)
+            model = Ollama(args.ollama_url, args.model)
+            names = [m["name"] for m in model.models().get("models", [])]
+            if args.model not in names:
+                raise ServiceError("Requested local model is not installed on the Ollama endpoint")
+            output = args.output or Path("artifacts") / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+            output.mkdir(parents=True, exist_ok=False)
+            output.chmod(0o700)
+            result = analyze_attack_surface(repo, model, Events(output / "events.jsonl"), args.max_turns)
+            write_attack_surface_reports(output, result)
+            print(f"Report: {(output / 'attack-vector-report.md').resolve()}")
+            print(f"JSON and tool events: {output.resolve()}")
             return 0
         if not 1 <= args.limit <= 10 or not 1 <= args.lookback_days <= 120:
             raise ValueError("limit must be 1–10 and lookback-days 1–120")
@@ -77,10 +98,14 @@ def main(argv=None):
         output.chmod(0o700)
         emit = Events(output / "events.jsonl")
         (output / "cves.json").write_text(json.dumps(cves, indent=2))
+        attack_repo = Repository(args.repository, source_suffixes=ATTACK_SURFACE_SUFFIXES)
+        attack_surface = analyze_attack_surface(attack_repo, model, emit, args.max_turns)
+        write_attack_surface_reports(output, attack_surface)
         results = []
         for cve in cves:
             emit("investigation_start", cve=cve["id"])
-            results.append(investigate(cve, repo, model, emit, args.max_turns))
+            results.append(investigate(cve, repo, model, emit, args.max_turns,
+                                       attack_surface=attack_surface))
             write_reports(output, results)
         print(f"Report: {(output / 'report.md').resolve()}")
         print(f"JSON and tool events: {output.resolve()}")
@@ -91,7 +116,7 @@ def main(argv=None):
         return 130
     except (ServiceError, ValueError, OSError) as exc:
         print(f"Cannot complete {args.command}: {exc}.", file=sys.stderr)
-        if args.command != "doctor":
+        if args.command in {"scan", "recent"}:
             print("No offline CVE fallback was used.", file=sys.stderr)
         return 1
 

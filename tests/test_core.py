@@ -7,9 +7,10 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 from spark_cve.agents import CONDITIONS, investigate, uncertain, validate_assessment
+from spark_cve.attack_surface import analyze_attack_surface, validate_attack_vector_report
 from spark_cve.clients import NVD, Ollama, ServiceError, normalize_cve
-from spark_cve.reporting import write_reports
-from spark_cve.tools import Repository
+from spark_cve.reporting import write_attack_surface_reports, write_reports
+from spark_cve.tools import ATTACK_SURFACE_SUFFIXES, ATTACK_SURFACE_TOOLS, Repository
 
 
 def record(identifier="CVE-2026-12345", published="2026-11-12T12:00:00.000", severity="HIGH"):
@@ -47,6 +48,26 @@ class RepositoryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.repo.read_file("linked.go")
         self.assertEqual(set(self.repo.list_files()["files"]), {"go.mod", "main.go"})
+
+    def test_slash_prefixed_tool_paths_are_relative_to_repository(self):
+        command_dir = self.root / "cmd"
+        command_dir.mkdir()
+        (command_dir / "main.go").write_text("package main\n")
+        self.assertEqual(self.repo.resolve("/"), self.root)
+        self.assertEqual(self.repo.resolve("/cmd"), command_dir)
+        relative_file = str(Path("cmd") / "main.go")
+        self.assertEqual(self.repo.read_file("/cmd/main.go")["path"], relative_file)
+        self.assertEqual(self.repo.list_files("/cmd")["files"], [relative_file])
+        for path in ("/../outside.go", r"C:\Windows\win.ini", r"\\server\share\file"):
+            with self.assertRaises(ValueError):
+                self.repo.resolve(path)
+
+    def test_attack_surface_scope_includes_app_code_but_default_does_not(self):
+        (self.root / "app.py").write_text("def handler(): pass\n")
+        self.assertNotIn("app.py", self.repo.list_files()["files"])
+        surface_repo = Repository(self.root, source_suffixes=ATTACK_SURFACE_SUFFIXES)
+        self.assertIn("app.py", surface_repo.list_files()["files"])
+        self.assertNotIn("run_check", {item["function"]["name"] for item in ATTACK_SURFACE_TOOLS})
 
     def test_dependency_declarations_and_replacements(self):
         dependencies = self.repo.inspect_dependencies()
@@ -161,29 +182,60 @@ class AgentTests(unittest.TestCase):
             return {"message": {"role": "assistant", "content": "test", "thinking": "private"}}
         self.assertNotIn("thinking", Ollama(transport=transport).chat([]))
 
-    def test_two_agents_real_tool_dispatch_report_pipeline(self):
+    def test_investigator_prover_disprover_reviewer_report_pipeline(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "go.mod").write_text("module example.test/app\ngo 1.23.0\n")
             repo = Repository(root)
-            messages = [
+            responses = [
                 {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "inspect_dependencies", "arguments": {}}}]},
                 {"role": "assistant", "content": json.dumps(answer(["E1"]))},
                 {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "go.mod"}}}]},
                 {"role": "assistant", "content": json.dumps(answer(["E2"]))},
+                {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "go.mod"}}}]},
+                {"role": "assistant", "content": json.dumps(answer(["E3"]))},
+                {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "go.mod"}}}]},
+                {"role": "assistant", "content": json.dumps(answer(["E4"]))},
             ]
+            contexts = []
             class ScriptedModel:
                 model = "test-transport-not-real-inference"
-                def chat(self, *args, **kwargs):
-                    return messages.pop(0)
+                def chat(self, conversation, **kwargs):
+                    if len(conversation) == 2:
+                        contexts.append({"system": conversation[0]["content"],
+                                         "user": json.loads(conversation[1]["content"])})
+                    return responses.pop(0)
+
+            attack_surface = {"analysis": {
+                "status": "PARTIAL", "summary": "Potential route needs verification.",
+                "attack_vectors": [{"id": "AV1", "entry_point": "POST /submit",
+                                    "user_controlled_inputs": ["request body"],
+                                    "evidence_ids": ["E1"]}],
+                "coverage_gaps": ["Deployment routing not inspected."]},
+                "snapshot": "attack-surface-snapshot"}
             events = []
-            result = investigate(normalize_cve(record()), repo, ScriptedModel(), lambda *a, **kw: events.append((a, kw)))
+            result = investigate(normalize_cve(record()), repo, ScriptedModel(),
+                                 lambda *a, **kw: events.append((a, kw)),
+                                 attack_surface=attack_surface)
             self.assertEqual(result["assessment"]["status"], "UNCERTAIN")
-            self.assertEqual([e["agent"] for e in result["evidence"]], ["investigator", "reviewer"])
+            self.assertEqual([e["agent"] for e in result["evidence"]],
+                             ["investigator", "prover", "disprover", "reviewer"])
+            self.assertEqual(contexts[0]["user"]["attack_surface_hints"]["attack_vectors"][0]["entry_point"],
+                             "POST /submit")
+            self.assertNotIn("evidence_ids",
+                             contexts[0]["user"]["attack_surface_hints"]["attack_vectors"][0])
+            self.assertIn("PROVER", contexts[1]["system"])
+            self.assertIn("DISPROVER", contexts[2]["system"])
+            self.assertEqual(set(contexts[3]["user"]["draft"]), {"investigator", "prover", "disprover"})
+            self.assertEqual(result["attack_surface"]["report"], "attack-vector-report.json")
             write_reports(root, [result])
             self.assertIn("E2", (root / "report.md").read_text())
+            self.assertIn("unverified leads", (root / "report.md").read_text())
+            self.assertIn("evidence-seeking perspective",
+                          (root / f"{record()['id']}-prover.md").read_text())
+            self.assertTrue((root / f"{record()['id']}-disprover.md").is_file())
             self.assertEqual(len(json.loads((root / "report.json").read_text())), 1)
-            self.assertEqual(messages, [])
+            self.assertEqual(responses, [])
 
     def test_model_failure_yields_uncertain(self):
         with tempfile.TemporaryDirectory() as root:
@@ -193,6 +245,65 @@ class AgentTests(unittest.TestCase):
                     raise ServiceError("unavailable")
             result = investigate(normalize_cve(record()), Repository(root), FailingModel(), lambda *a, **k: None)
             self.assertEqual(result["assessment"]["status"], "UNCERTAIN")
+
+    def test_attack_vector_agent_cites_source_and_writes_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.py").write_text("def handler(request):\n    return request.args.get('name')\n")
+            repo = Repository(root, source_suffixes=ATTACK_SURFACE_SUFFIXES)
+            vector = {"id": "AV1", "category": "http_endpoint", "entry_point": "GET /profile",
+                      "user_controlled_inputs": ["query parameter `name`"],
+                      "data_flow": "Handler reads the `name` query parameter.",
+                      "potential_risk": "Input reaches response handling; downstream encoding is unclear.",
+                      "controls_observed": "Not established in inspected lines.", "evidence_ids": ["E1"],
+                      "confidence": "medium", "recommendation": "Trace route registration and response encoding."}
+            report = {"status": "PARTIAL", "summary": "One route needs follow-up.",
+                      "attack_vectors": [vector], "coverage_gaps": ["Deployment routing was not inspected."]}
+            messages = [
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"function": {"name": "read_file", "arguments": {"path": "app.py"}}}]},
+                {"role": "assistant", "content": json.dumps(report)},
+            ]
+
+            class ScriptedModel:
+                model = "test"
+                def chat(self, *args, **kwargs):
+                    if kwargs.get("tools") is not None:
+                        self.assert_no_execution_tool(kwargs["tools"])
+                    return messages.pop(0)
+
+                @staticmethod
+                def assert_no_execution_tool(tools):
+                    if any(item["function"]["name"] == "run_check" for item in tools):
+                        raise AssertionError("Attack-surface agent must not be offered execution tools")
+
+            result = analyze_attack_surface(repo, ScriptedModel(), lambda *a, **k: None)
+            self.assertEqual(result["analysis"]["attack_vectors"][0]["evidence_ids"], ["E1"])
+            write_attack_surface_reports(root, result)
+            self.assertIn("GET /profile", (root / "attack-vector-report.md").read_text())
+            self.assertEqual(json.loads((root / "attack-vector-report.json").read_text())["agent"],
+                             "attack-vector-analyser")
+            self.assertEqual(messages, [])
+
+    def test_attack_vector_report_rejects_uncited_vectors(self):
+        vector = {"id": "AV1", "category": "http_endpoint", "entry_point": "POST /submit",
+                  "user_controlled_inputs": ["request body"], "data_flow": "Unknown",
+                  "potential_risk": "Unknown", "controls_observed": "Unknown", "evidence_ids": ["E404"],
+                  "confidence": "low", "recommendation": "Inspect the handler."}
+        report = {"status": "PARTIAL", "summary": "Partial", "attack_vectors": [vector], "coverage_gaps": []}
+        with self.assertRaises(ValueError):
+            validate_attack_vector_report(report, [])
+
+    def test_attack_vector_model_failure_produces_partial_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            class FailingModel:
+                model = "test"
+                def chat(self, *args, **kwargs):
+                    raise ServiceError("unavailable")
+
+            result = analyze_attack_surface(Repository(directory), FailingModel(), lambda *a, **k: None)
+            self.assertEqual(result["analysis"]["status"], "PARTIAL")
+            self.assertIn("unavailable", result["analysis"]["summary"])
 
 
 if __name__ == "__main__":

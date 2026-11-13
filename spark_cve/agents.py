@@ -111,15 +111,44 @@ def clipped(value, limit):
                        "excerpt": text[:limit]})
 
 
-def run_agent(role, cve, repo, model, emit, draft=None, max_turns=10):
+def run_agent(role, cve, repo, model, emit, draft=None, max_turns=10, attack_surface_hints=None,
+              prior_agent_evidence=None):
     instruction = SYSTEM
     if role == "reviewer":
-        instruction += "\nIndependently challenge the draft. Use read_file or inspect_dependencies yourself. Verify cited evidence, identity, active version, reachability and mitigations. Downgrade unsupported claims. Record challenges in review_notes."
+        instruction += ("\nEvaluate the investigator, prover, and disprover reports together. Independently inspect "
+                        "the repository and cited evidence; resolve disagreements rather than voting. Verify "
+                        "component identity, active version, reachability, attacker-controlled input, and "
+                        "mitigations. Return the final evidence-backed assessment and record your reasoning "
+                        "briefly in review_notes.")
+    if role == "prover":
+        instruction += ("\nYou are the PROVER. Make the strongest fair, evidence-backed case that this specific "
+                        "CVE affects this repository. Seek evidence for the vulnerable component/version, "
+                        "reachable vulnerable path, attacker-controlled input, and insufficient mitigation. "
+                        "Use the investigator's assessment as a lead, not as proof. Do not ignore counterevidence "
+                        "or invent facts. Mark AFFECTED only if every required prerequisite is proven; otherwise "
+                        "use UNCERTAIN. Record the strongest supporting and limiting evidence in review_notes.")
+    if role == "disprover":
+        instruction += ("\nYou are the DISPROVER. Make the strongest fair, evidence-backed case that this specific "
+                        "CVE does not affect this repository. Seek evidence disproving at least one necessary "
+                        "prerequisite, such as component identity, affected version, reachable path, attacker "
+                        "control, or mitigation. Use the investigator's assessment as a lead, not as proof. "
+                        "Absence from a search is not proof; do not ignore positive evidence or invent facts. "
+                        "Mark NOT AFFECTED only when a necessary prerequisite is disproven with evidence; "
+                        "otherwise use UNCERTAIN. Record the strongest contrary and limiting evidence in review_notes.")
+    if role == "investigator" and attack_surface_hints is not None:
+        instruction += ("\nA separate attack-vector analysis is provided as unverified navigation hints only. "
+                        "Verify relevant routes and data flows using your own repository tools for this CVE. "
+                        "Do not treat these hints as proof and do not cite their evidence IDs; cite only "
+                        "evidence gathered in this investigation.")
     instruction += "\nFinal JSON schema:\n" + json.dumps(ASSESSMENT_SCHEMA)
     context = {"cve": cve, "repository_snapshot": repo.snapshot,
                "execution_enabled": repo.allow_execution, "draft": draft}
-    if draft is not None:
-        context["investigator_evidence"] = repo.evidence
+    if attack_surface_hints is not None:
+        context["attack_surface_hints"] = attack_surface_hints
+    if prior_agent_evidence is None and draft is not None:
+        prior_agent_evidence = repo.evidence
+    if prior_agent_evidence is not None:
+        context["prior_agent_evidence"] = prior_agent_evidence
     messages = [{"role": "system", "content": instruction},
                 {"role": "user", "content": clipped(context, 14000)}]
     own_start = len(repo.evidence)
@@ -175,21 +204,53 @@ def run_agent(role, cve, repo, model, emit, draft=None, max_turns=10):
     return uncertain("Agent exhausted its tool/format budget without a valid evidence-backed assessment")
 
 
-def investigate(cve, repo, model, emit, max_turns=10):
+def investigate(cve, repo, model, emit, max_turns=10, attack_surface=None):
     repo.evidence = []
     repo.snapshot = repo.fingerprint()
+    attack_surface_hints = None
+    attack_surface_reference = None
+    if attack_surface is not None:
+        analysis = attack_surface["analysis"]
+        attack_surface_hints = {key: analysis[key] for key in ("status", "summary", "coverage_gaps")}
+        attack_surface_hints["attack_vectors"] = [
+            {key: value for key, value in vector.items() if key != "evidence_ids"}
+            for vector in analysis["attack_vectors"]]
+        attack_surface_reference = {"status": analysis["status"],
+                                    "snapshot": attack_surface["snapshot"],
+                                    "report": "attack-vector-report.json"}
     try:
-        draft = run_agent("investigator", cve, repo, model, emit, max_turns=max_turns)
+        draft = run_agent("investigator", cve, repo, model, emit, max_turns=max_turns,
+                          attack_surface_hints=attack_surface_hints)
     except (ServiceError, ValueError, TypeError, KeyError) as exc:
         draft = uncertain(f"Investigator failed: {exc}")
     emit("draft", cve=cve["id"], status=draft["status"])
+    investigator_evidence = list(repo.evidence)
+
     try:
-        final = run_agent("reviewer", cve, repo, model, emit, draft=draft, max_turns=max_turns)
+        prover = run_agent("prover", cve, repo, model, emit, draft={"investigator": draft},
+                           max_turns=max_turns, prior_agent_evidence=investigator_evidence)
+    except (ServiceError, ValueError, TypeError, KeyError) as exc:
+        prover = uncertain(f"Prover failed: {exc}")
+    emit("prover", cve=cve["id"], status=prover["status"])
+
+    try:
+        disprover = run_agent("disprover", cve, repo, model, emit, draft={"investigator": draft},
+                              max_turns=max_turns, prior_agent_evidence=investigator_evidence)
+    except (ServiceError, ValueError, TypeError, KeyError) as exc:
+        disprover = uncertain(f"Disprover failed: {exc}")
+    emit("disprover", cve=cve["id"], status=disprover["status"])
+
+    review_context = {"investigator": draft, "prover": prover, "disprover": disprover}
+    try:
+        final = run_agent("reviewer", cve, repo, model, emit, draft=review_context,
+                          max_turns=max_turns, prior_agent_evidence=list(repo.evidence))
     except (ServiceError, ValueError, TypeError, KeyError) as exc:
         final = uncertain(f"Review failed: {exc}")
     if repo.fingerprint() != repo.snapshot:
         final = uncertain("Repository source changed during investigation; rerun against a stable directory")
     emit("verdict", cve=cve["id"], status=final["status"])
-    return {"cve": cve, "investigator": draft, "assessment": final,
+    return {"cve": cve, "investigator": draft, "prover": prover, "disprover": disprover,
+            "assessment": final,
             "evidence": list(repo.evidence), "snapshot": repo.snapshot,
-            "model": model.model, "patch_validation": "not_applied_or_tested"}
+            "model": model.model, "patch_validation": "not_applied_or_tested",
+            "attack_surface": attack_surface_reference}

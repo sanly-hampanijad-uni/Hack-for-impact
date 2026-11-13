@@ -8,6 +8,12 @@ import subprocess
 
 EXCLUDED = {".git", ".aws", ".ssh", ".codex", ".agents", "vendor", "node_modules", ".venv", "artifacts"}
 TEXT_SUFFIXES = {".go", ".mod", ".sum", ".work", ".md", ".yaml", ".yml", ".json", ".toml", ".txt", ".conf"}
+ATTACK_SURFACE_SUFFIXES = {
+    ".c", ".cc", ".cpp", ".cs", ".csproj", ".cjs", ".cts", ".dart", ".ex", ".exs",
+    ".h", ".hpp", ".html", ".java", ".js", ".jsx", ".kt", ".kts", ".mjs", ".mts",
+    ".php", ".properties", ".py", ".rb", ".razor", ".rs", ".scala", ".sh", ".sql",
+    ".svelte", ".swift", ".ts", ".tsx", ".vue", ".xml", ".ps1", ".jsp",
+}
 
 
 def tool(name, description, properties, required=()):
@@ -17,11 +23,11 @@ def tool(name, description, properties, required=()):
 
 
 TOOLS = [
-    tool("list_files", "List permitted repository text files; reports truncation.",
+    tool("list_files", "List permitted repository text files. Path is relative to the repository root; use '.' for its root.",
          {"path": {"type": "string"}}),
-    tool("read_file", "Read numbered lines from a repository file.",
+    tool("read_file", "Read numbered lines from a repository-relative file path.",
          {"path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}}, ["path"]),
-    tool("search_code", "Literal, case-insensitive search with numbered matches.",
+    tool("search_code", "Literal, case-insensitive search with numbered matches; optional path is repository-relative.",
          {"query": {"type": "string"}, "path": {"type": "string"}}, ["query"]),
     tool("inspect_dependencies", "Read Go manifests. Declared requirements are NOT the resolved build list; replacements and workspaces matter.", {}),
     tool("compare_versions", "Compare simple Go release versions deterministically. Returns unknown for pseudo/prerelease versions.",
@@ -29,16 +35,18 @@ TOOLS = [
     tool("run_check", "Execute a fixed Go check in a disposable restricted Docker container, if enabled.",
          {"check_id": {"type": "string", "enum": ["go_test", "go_vet", "go_build_list"]}}, ["check_id"]),
 ]
+ATTACK_SURFACE_TOOLS = [item for item in TOOLS if item["function"]["name"] != "run_check"]
 
 
 class Repository:
     def __init__(self, root, *, allow_execution=False, allow_downloads=False, image="golang:1.24",
-                 timeout=90):
+                 timeout=90, source_suffixes=()):
         self.root = Path(root).resolve()
         if not self.root.is_dir():
             raise ValueError("Repository directory does not exist")
         self.allow_execution, self.allow_downloads = allow_execution, allow_downloads
         self.image, self.timeout = image, timeout
+        self.source_suffixes = TEXT_SUFFIXES | set(source_suffixes)
         self.evidence = []
         # Snapshot only eligible source files; no secret contents or Git objects.
         self.snapshot = self.fingerprint()
@@ -53,11 +61,18 @@ class Repository:
     def permitted(self, path):
         relative = path.relative_to(self.root)
         return (not any(p.startswith(".") or p in EXCLUDED for p in relative.parts)
-                and path.suffix in TEXT_SUFFIXES and path.stat().st_size <= 256_000
+                and path.suffix in self.source_suffixes and path.stat().st_size <= 256_000
                 and not any(s in path.name.lower() for s in ("secret", "credential", "id_rsa", "private_key")))
 
     def resolve(self, path="."):
-        candidate = self.root / path
+        if not isinstance(path, str):
+            raise ValueError("Repository path must be a string")
+        if re.match(r"^[a-zA-Z]:", path) or path.startswith(("\\\\", "//")):
+            raise ValueError("Absolute paths are not permitted")
+        relative = path.replace("\\", "/").lstrip("/") or "."
+        if ".." in relative.split("/"):
+            raise ValueError("Path escapes repository")
+        candidate = self.root / relative
         # Reject all symlinks, including ones pointing back inside the repository.
         if any(p.is_symlink() for p in [candidate, *candidate.parents] if p != self.root.parent):
             raise ValueError("Symlink paths are not permitted")
@@ -191,8 +206,8 @@ class Repository:
                 except (OSError, subprocess.TimeoutExpired):
                     pass
 
-    def invoke(self, agent, name, arguments):
-        allowed = {t["function"]["name"] for t in TOOLS}
+    def invoke(self, agent, name, arguments, allowed_tools=TOOLS):
+        allowed = {t["function"]["name"] for t in allowed_tools}
         if not isinstance(name, str) or name not in allowed:
             result = {"error": "Unknown tool"}
         else:

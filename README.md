@@ -27,7 +27,8 @@
 Spark CVE is a CLI that investigates whether a **local Go repository** is exposed
 to a specific CVE, using Nemotron running on NVIDIA DGX Spark. It retrieves live
 NVD records, lets an investigator choose repository tools, has a separate reviewer
-challenge the conclusion, and writes Markdown/JSON reports with captured evidence.
+evaluate investigator, prover, and disprover findings, and writes Markdown/JSON
+reports with captured evidence.
 
 ### Quick start
 
@@ -75,12 +76,31 @@ Investigate one known CVE, still fetched live from NVD (replace the placeholder)
 python3 -m spark_cve scan /absolute/path/to/go-repository --cve CVE-YYYY-NNNNN --prompt-key
 ```
 
+Create a separate, source-based attack-surface report without querying NVD:
+
+```bash
+python3 -m spark_cve attack-surface /absolute/path/to/application
+```
+
+The `attack-vector-analyser` reviews permitted source/configuration files for
+HTTP routes, CLI/file inputs, and other user-controlled data flows. It uses
+read-only repository tools and does not execute code, send HTTP requests, or
+generate payloads or exploit steps. Findings are potential vectors, not confirmed
+vulnerabilities; excluded files and deployment/runtime configuration can leave
+coverage gaps.
+
+The `scan` command also runs this analysis once before the CVE investigations.
+Its findings are passed to each investigator as unverified navigation hints;
+the investigator must verify relevant paths with its own evidence before using
+them in a CVE assessment.
+
 Useful options:
 
 ```bash
 python3 -m spark_cve --ollama-url http://127.0.0.1:11435 --model nemotron-3-nano:30b doctor
 python3 -m spark_cve scan /absolute/path/to/go-repository --limit 1 --max-turns 6 --prompt-key
 python3 -m spark_cve scan --help
+python3 -m spark_cve attack-surface --help
 ```
 
 Global options (`--model`, `--ollama-url`) precede the subcommand. Model transport
@@ -118,10 +138,15 @@ Each scan creates a new private `artifacts/<timestamp>/` directory containing:
 
 - `cves.json`: structured live NVD context with retrieval timestamps.
 - `events.jsonl`: public agent/tool activity and tool results, not hidden reasoning.
-- `report.json`: investigator draft, reviewer assessment, evidence, model, and source fingerprint.
+- `report.json`: investigator, prover, disprover, reviewer assessments, evidence, model, and source fingerprint.
 - `report.md`: exposure report, prerequisite findings, cited file/line evidence,
   reproduction instructions, missing information, remediation, and suggested diff.
+- `<CVE>-prover.md` and `<CVE>-disprover.md`: separate evidence-cited perspective reports.
 - `<CVE>.suggested.diff`: emitted when a supported fix can be proposed.
+
+The `attack-surface` command writes `attack-vector-report.md` and
+`attack-vector-report.json` alongside `events.jsonl` in its output directory.
+`scan` writes the same attack-vector reports in addition to its CVE reports.
 
 Artifacts contain source excerpts; treat them as private. The entire artifacts
 directory is ignored by Git. Reports are saved after each completed CVE.
@@ -168,9 +193,10 @@ manifests may require additional evidence and result in UNCERTAIN.
 
 The laptop runs tools and orchestration. Only CVE API parameters go to NVD.
 Selected source excerpts go through the SSH tunnel to Ollama on DGX Spark;
-there is no hosted LLM provider or source upload to a CVE service. Both agent roles
-share one model but use separate conversations. A reviewer must inspect repository
-content itself. Tool permissions remain in deterministic application code.
+there is no hosted LLM provider or source upload to a CVE service. The attack-vector
+analyser, investigator, prover, disprover, and reviewer share one model but use
+separate conversations. The reviewer must inspect repository content itself.
+Tool permissions remain in deterministic application code.
 Hidden paths and common secret filenames are excluded, but source files can still
 contain embedded credentials; review your repository before sharing excerpts with
 the trusted Spark host.
