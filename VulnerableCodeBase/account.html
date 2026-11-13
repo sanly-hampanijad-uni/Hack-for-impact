@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f2f3ed">
+  <title>Your account | Vulnerability Generation Agent</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172620;
+      --muted: #64746b;
+      --paper: #f2f3ed;
+      --panel: #fffefa;
+      --line: #d7ddd4;
+      --green: #17684d;
+      --green-dark: #104c39;
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background-color: var(--paper);
+      background-image: linear-gradient(135deg, rgba(23, 104, 77, .05) 25%, transparent 25%),
+        linear-gradient(315deg, rgba(195, 83, 63, .045) 25%, transparent 25%);
+      background-position: 0 0, 24px 24px;
+      background-size: 48px 48px;
+    }
+    main {
+      width: min(840px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: clamp(40px, 8vh, 88px) 0;
+    }
+    .eyebrow {
+      margin: 0 0 16px;
+      color: var(--green);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+    }
+    h1 {
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(42px, 6vw, 64px);
+      font-weight: 400;
+      line-height: 1.05;
+    }
+    .lede { margin: 16px 0 32px; color: var(--muted); line-height: 1.6; }
+    .account-panel {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      box-shadow: 12px 12px 0 rgba(23, 104, 77, .08);
+    }
+    .account-panel h2 {
+      margin: 0;
+      padding: 20px 24px;
+      border-bottom: 1px solid var(--line);
+      font-size: 16px;
+    }
+    dl { margin: 0; padding: 0 24px; }
+    .detail {
+      display: grid;
+      grid-template-columns: minmax(120px, 1fr) 2fr;
+      gap: 20px;
+      padding: 18px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    dt { color: var(--muted); }
+    dd { margin: 0; font-weight: 700; overflow-wrap: anywhere; }
+    .actions { display: flex; align-items: center; gap: 18px; padding: 20px 24px; }
+    button {
+      min-height: 44px;
+      padding: 0 18px;
+      border: 0;
+      background: var(--green);
+      color: white;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:hover { background: var(--green-dark); }
+    a { color: var(--green); font-weight: 700; }
+    @media (max-width: 520px) {
+      main { width: calc(100% - 32px); }
+      .detail { grid-template-columns: 1fr; gap: 6px; }
+      .actions { align-items: flex-start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="eyebrow">Vulnerability Generation Agent / Account</p>
+    <h1>Your account</h1>
+    <p class="lede">You are signed in. Here are the details for this local account.</p>
+    <section class="account-panel" aria-labelledby="account-details-title">
+      <h2 id="account-details-title">Account details</h2>
+      <dl>
+        <div class="detail">
+          <dt>Username</dt>
+          <dd>{{.Username}}</dd>
+        </div>
+        <div class="detail">
+          <dt>Account type</dt>
+          <dd>Local account</dd>
+        </div>
+        <div class="detail">
+          <dt>Session</dt>
+          <dd>Active</dd>
+        </div>
+        <div class="detail">
+          <dt>Storage</dt>
+          <dd>In memory</dd>
+        </div>
+      </dl>
+      <div class="actions">
+        <button id="sign-out" type="button">Sign out</button>
+        <a href="/">Back to sign in</a>
+      </div>
+    </section>
+  </main>
+  <script>
+    document.querySelector('#sign-out').addEventListener('click', async () => {
+      const response = await fetch('/api/v1/logout', { method: 'POST' });
+      if (response.ok) window.location.assign('/');
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f2f3ed">
+  <title>{{if .NotFound}}Page not found{{else}}Access | Vulnerability Generation Agent{{end}}</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172620;
+      --muted: #64746b;
+      --paper: #f2f3ed;
+      --panel: #fffefa;
+      --line: #d7ddd4;
+      --green: #17684d;
+      --green-dark: #104c39;
+      --coral: #c3533f;
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background-color: var(--paper);
+      background-image: linear-gradient(135deg, rgba(23, 104, 77, .05) 25%, transparent 25%),
+        linear-gradient(315deg, rgba(195, 83, 63, .045) 25%, transparent 25%);
+      background-position: 0 0, 24px 24px;
+      background-size: 48px 48px;
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(320px, 430px);
+      align-items: center;
+      gap: clamp(40px, 9vw, 140px);
+      width: min(1120px, calc(100% - 48px));
+      min-height: 100vh;
+      margin: 0 auto;
+      padding: 64px 0;
+    }
+    .intro { max-width: 520px; }
+    .eyebrow {
+      margin: 0 0 22px;
+      color: var(--green);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+    }
+    h1 {
+      max-width: 12ch;
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(42px, 6vw, 72px);
+      font-weight: 400;
+      line-height: 1.02;
+    }
+    .lede {
+      max-width: 40ch;
+      margin: 24px 0 0;
+      color: var(--muted);
+      font-size: 17px;
+      line-height: 1.65;
+    }
+    .login-panel {
+      padding: 32px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      box-shadow: 12px 12px 0 rgba(23, 104, 77, .08);
+    }
+    .tabs {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4px;
+      padding: 4px;
+      background: var(--paper);
+    }
+    .tabs button {
+      min-height: 42px;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .tabs button[aria-selected="true"] { background: white; color: var(--ink); }
+    form { display: grid; gap: 17px; margin-top: 26px; }
+    label { display: grid; gap: 7px; font-size: 13px; font-weight: 700; }
+    input {
+      width: 100%;
+      min-height: 46px;
+      padding: 0 12px;
+      border: 1px solid var(--line);
+      border-radius: 0;
+      background: white;
+      color: var(--ink);
+      font: inherit;
+    }
+    input:focus { outline: 2px solid var(--green); outline-offset: 1px; }
+    .submit, #logout {
+      min-height: 48px;
+      border: 0;
+      background: var(--green);
+      color: white;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .submit:hover, #logout:hover { background: var(--green-dark); }
+    #message { min-height: 22px; margin: 18px 0 0; color: var(--muted); font-size: 14px; line-height: 1.5; }
+    #message[data-error="true"] { color: var(--coral); }
+    #session-view { display: none; margin-top: 22px; }
+    #session-view p { margin: 0 0 18px; line-height: 1.5; }
+    #logout { width: 100%; }
+    .back { display: inline-block; margin-top: 28px; color: var(--green); font-weight: 700; }
+    @media (max-width: 760px) {
+      main { grid-template-columns: 1fr; gap: 38px; width: min(520px, calc(100% - 36px)); padding: 48px 0; }
+      h1 { font-size: 48px; }
+      .login-panel { padding: 24px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="intro" aria-labelledby="page-title">
+      <p class="eyebrow">Vulnerability Generation Agent</p>
+      {{if .NotFound}}
+      <h1 id="page-title">This page isn't here.</h1>
+      <p class="lede">The address may be out of date, or the page may have moved.</p>
+      <a class="back" href="/">Return to the landing page</a>
+      {{else}}
+      <h1 id="page-title">Make space for safer code.</h1>
+      <p class="lede">Sign in to your workspace or create an account to get started.</p>
+      {{end}}
+    </section>
+    {{if not .NotFound}}
+    <section class="login-panel" aria-label="Account access">
+      <div class="tabs" role="tablist" aria-label="Choose an account action">
+        <button id="login-tab" type="button" role="tab" aria-selected="true">Sign in</button>
+        <button id="register-tab" type="button" role="tab" aria-selected="false">Create account</button>
+      </div>
+      <form id="auth-form">
+        <label for="username">Username
+          <input id="username" name="username" autocomplete="username" minlength="3" maxlength="32" required>
+        </label>
+        <label for="password">Password
+          <input id="password" name="password" type="password" autocomplete="current-password" minlength="8" maxlength="72" required>
+        </label>
+        <button id="submit" class="submit" type="submit">Sign in</button>
+      </form>
+      <p id="message" role="status" aria-live="polite"></p>
+      <div id="session-view">
+        <p id="welcome"></p>
+        <button id="logout" type="button">Sign out</button>
+      </div>
+    </section>
+    {{end}}
+  </main>
+  {{if not .NotFound}}
+  <script>
+    const form = document.querySelector('#auth-form');
+    const message = document.querySelector('#message');
+    const loginTab = document.querySelector('#login-tab');
+    const registerTab = document.querySelector('#register-tab');
+    const submit = document.querySelector('#submit');
+    let mode = 'login';
+
+    function setMode(nextMode) {
+      mode = nextMode;
+      const registering = mode === 'register';
+      loginTab.setAttribute('aria-selected', String(!registering));
+      registerTab.setAttribute('aria-selected', String(registering));
+      submit.textContent = registering ? 'Create account' : 'Sign in';
+      document.querySelector('#password').autocomplete = registering ? 'new-password' : 'current-password';
+      message.textContent = '';
+      message.dataset.error = 'false';
+    }
+
+    loginTab.addEventListener('click', () => setMode('login'));
+    registerTab.addEventListener('click', () => setMode('register'));
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      message.dataset.error = 'false';
+      try {
+        const response = await fetch(`/api/v1/${mode}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: form.elements.username.value,
+            password: form.elements.password.value
+          })
+        });
+        const body = response.status === 204 ? {} : await response.json();
+        if (!response.ok) throw new Error(body.error || 'Request failed.');
+        window.location.assign('/account');
+      } catch (error) {
+        message.textContent = error.message || 'Could not reach the server.';
+        message.dataset.error = 'true';
+      }
+    });
+
+    fetch('/api/v1/me')
+      .then(async (response) => response.ok ? response.json() : null)
+      .then((body) => { if (body) window.location.replace('/account'); })
+      .catch(() => {});
+  </script>
+  {{end}}
+</body>
+</html>
