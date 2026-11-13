@@ -27,6 +27,8 @@ def parser():
         command.add_argument("--limit", type=int, default=2, help="Number of recent CVEs (default: 2; maximum: 10)")
         command.add_argument("--lookback-days", type=int, default=30)
         command.add_argument("--nvd-timeout", type=int, default=45, help="Seconds per live NVD request attempt (default: 45; up to 3 attempts)")
+        command.add_argument("--nvd-page-size", type=int, default=2000,
+                             help="CVE records requested per NVD page (default and NVD maximum: 2000)")
     scan.add_argument("repository", type=Path)
     scan.add_argument("--cve", help="Investigate this CVE instead of the recent batch; still fetched live")
     scan.add_argument("--output", type=Path, help="New output directory (defaults to artifacts/<timestamp>)")
@@ -61,6 +63,8 @@ def main(argv=None):
             raise ValueError("limit must be 1–10 and lookback-days 1–120")
         if not 1 <= args.nvd_timeout <= 180:
             raise ValueError("nvd-timeout must be 1–180 seconds")
+        if not 1 <= args.nvd_page_size <= 2000:
+            raise ValueError("nvd-page-size must be 1–2000")
         key = load_nvd_key(env_file=args.env_file, prompt=args.prompt_key)
         if args.command == "scan":
             if not 1 <= args.max_turns <= 30:
@@ -98,7 +102,8 @@ def main(argv=None):
                 emit(kind, **data)
             else:
                 print(f"{kind}: " + json.dumps(data), file=sys.stderr, flush=True)
-        nvd = NVD(key, timeout=args.nvd_timeout, progress=nvd_progress)
+        nvd = NVD(key, timeout=args.nvd_timeout, progress=nvd_progress,
+                  page_size=args.nvd_page_size)
         print("Retrieving live NVD records…", file=sys.stderr, flush=True)
         cves = [nvd.get(args.cve.upper())] if getattr(args, "cve", None) else nvd.recent(args.limit, args.lookback_days)
         if not cves:

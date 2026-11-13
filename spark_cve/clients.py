@@ -65,10 +65,14 @@ def normalize_cve(record):
 class NVD:
     endpoint = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
-    def __init__(self, key=None, transport=request_json, sleep=time.sleep, timeout=45, progress=None):
+    def __init__(self, key=None, transport=request_json, sleep=time.sleep, timeout=45, progress=None,
+                 page_size=2000):
+        if not 1 <= page_size <= 2000:
+            raise ValueError("NVD page size must be 1–2000")
         self.key, self.transport, self.sleep = key, transport, sleep
         self.last_request = None
         self.timeout = timeout
+        self.page_size = page_size
         self.progress = progress or (lambda kind, **data: None)
 
     def fetch(self, **params):
@@ -84,7 +88,10 @@ class NVD:
                 result = self.transport(self.endpoint + "?" + urlencode(params),
                                         headers={"apiKey": self.key} if self.key else {}, timeout=self.timeout)
                 self.progress("nvd_response", elapsed_seconds=round(time.monotonic() - started, 2),
-                              records=len(result.get("vulnerabilities", [])))
+                              records=len(result.get("vulnerabilities", [])),
+                              total_results=result.get("totalResults"),
+                              start_index=result.get("startIndex", params.get("startIndex", 0)),
+                              results_per_page=result.get("resultsPerPage", params.get("resultsPerPage")))
                 return result
             except ServiceError as exc:
                 retryable = exc.retryable or exc.status in {429, 500, 502, 503, 504}
@@ -118,7 +125,7 @@ class NVD:
             while True:
                 page = self.fetch(pubStartDate=start.isoformat(timespec="milliseconds"),
                                   pubEndDate=end.isoformat(timespec="milliseconds"),
-                                  resultsPerPage=100, startIndex=index)
+                                  resultsPerPage=self.page_size, startIndex=index)
                 rows = page.get("vulnerabilities", [])
                 for row in rows:
                     cve = normalize_cve(row["cve"])

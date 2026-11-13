@@ -199,16 +199,35 @@ class NVDTests(unittest.TestCase):
         calls = []
         def transport(url, **kwargs):
             params = parse_qs(urlparse(url).query)
-            self.assertEqual(params["resultsPerPage"], ["100"])
+            self.assertEqual(params["resultsPerPage"], ["2000"])
             index = int(params["startIndex"][0])
             calls.append(index)
             rows = [record("CVE-2026-10001", "2026-11-12T01:00:00.000"),
                     record("CVE-2026-10002", "2026-11-12T02:00:00.000", "LOW"),
                     record("CVE-2026-10003", "2026-11-12T03:00:00.000", "CRITICAL")]
-            return {"totalResults": 3, "vulnerabilities": [{"cve": rows[index]}]}
+            return {"totalResults": 3, "resultsPerPage": 2000, "startIndex": index,
+                    "vulnerabilities": [{"cve": row} for row in rows[index:index + 2000]]}
         rows = NVD(transport=transport, sleep=lambda _: None).recent(2)
-        self.assertEqual(calls, [0, 1, 2])
+        self.assertEqual(calls, [0])
         self.assertEqual([r["id"] for r in rows], ["CVE-2026-10003", "CVE-2026-10001"])
+
+    def test_configurable_page_size_still_fully_paginates(self):
+        calls = []
+        rows = [record(f"CVE-2026-{10001 + i}", f"2026-11-12T0{i + 1}:00:00.000") for i in range(3)]
+        def transport(url, **kwargs):
+            params = parse_qs(urlparse(url).query)
+            size = int(params["resultsPerPage"][0])
+            index = int(params["startIndex"][0])
+            calls.append(index)
+            return {"totalResults": len(rows), "resultsPerPage": size, "startIndex": index,
+                    "vulnerabilities": [{"cve": row} for row in rows[index:index + size]]}
+        result = NVD(transport=transport, sleep=lambda _: None, page_size=2).recent(3)
+        self.assertEqual(calls, [0, 2])
+        self.assertEqual(len(result), 3)
+
+    def test_page_size_is_bounded_by_nvd_limit(self):
+        with self.assertRaisesRegex(ValueError, "1–2000"):
+            NVD(page_size=2001)
 
     def test_failure_is_not_fallback(self):
         def fail(*args, **kwargs):

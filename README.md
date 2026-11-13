@@ -241,7 +241,7 @@ captured exit codes, and passed/failed/unavailable/timeout outcomes separately.
 
 ### NVD selection policy
 
-The client fully paginates one-day publication windows (100 records per request), searches backwards up
+The client fully paginates one-day publication windows (up to 2,000 records per request by default), searches backwards up
 to 30 days by default, chooses HIGH/CRITICAL records, sorts by publication time
 descending, and takes the requested count (2 by default, up to 10). Once enough matches have been found, older windows cannot
 displace those matches. If fewer are found, the CLI states the bounded search
@@ -252,8 +252,10 @@ NVD requests retry transient HTTP errors and network timeouts up to three total
 attempts, with visible request/retry events. Authentication errors are not retried.
 The timeout defaults to 45 seconds per attempt; use `--nvd-timeout 90` if the live
 service is slow. Three timed-out attempts at that setting can take over four
-minutes including backoff. Smaller pages reduce response size but cannot fix an
-unavailable NVD service. Retrieval still stops without an offline fallback.
+minutes including backoff. `--nvd-page-size` can reduce response size on a constrained
+connection, but the 2,000-record default usually avoids many sequential requests.
+Neither setting can fix an unavailable NVD service. Retrieval still stops without
+an offline fallback.
 
 Score policy: CVSS 4.0 first, then 3.1, then 3.0; prefer the Primary source within
 that version, otherwise the first available source. Preserve the selected score

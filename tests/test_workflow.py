@@ -26,6 +26,21 @@ def findings(*values):
 
 
 class VerdictTests(unittest.TestCase):
+    def test_failed_tool_is_coverage_evidence_only(self):
+        evidence = [{"id": "E8", "tool": "read_dependency_file", "result": {"error": "missing package"}}]
+        data = uncertain("Dependency source unavailable")
+        data["conditions"] = [{"name": "component", "finding": "disproven", "explanation": "Not established", "evidence_ids": ["E8"]}]
+        with self.assertRaisesRegex(ValueError, "component: failed-tool evidence.*E8"):
+            validate_assessment(data, evidence)
+        data["conditions"][0]["finding"] = "unknown"
+        self.assertEqual(validate_assessment(data, evidence)["status"], "UNCERTAIN")
+
+    def test_unknown_reference_reports_specific_id_and_condition(self):
+        data = uncertain("Missing evidence")
+        data["conditions"] = [{"name": "component", "finding": "unknown", "explanation": "Unknown", "evidence_ids": ["E999"]}]
+        with self.assertRaisesRegex(ValueError, "component: unknown evidence IDs.*E999"):
+            validate_assessment(data, [])
+
     def test_alternative_paths_do_not_all_need_to_be_present(self):
         self.assertEqual(derive_verdict(findings("proven", "proven", "proven", "unknown"), plan()), "AFFECTED")
         self.assertEqual(derive_verdict(findings("proven", "proven", "disproven", "unknown"), plan()), "UNCERTAIN")
@@ -55,6 +70,17 @@ class VerdictTests(unittest.TestCase):
         result = create_plan({"id": "SYNTHETIC"}, {}, Model(), lambda *a, **k: None)
         self.assertEqual(result["trigger_logic"], "any")
         self.assertEqual([c["name"] for c in result["conditions"]], ["component", "affected_version", "trigger_1"])
+
+    def test_commit_hash_is_not_treated_as_ordered_version(self):
+        raw = {"component": "example", "component_kind": "application", "version_condition": ">= 731ca82",
+               "trigger_logic": "any", "triggers": [{"condition": "race", "proof": "matching trace", "disproof": "guarded"}],
+               "symbols": [], "queries": []}
+        class Model:
+            def chat(self, *a, **k):
+                return {"content": json.dumps(raw)}
+        result = create_plan({"id": "SYNTHETIC", "description": "Affected through commit 731ca82"}, {}, Model(), lambda *a, **k: None)
+        self.assertIn("source/ancestry", result["version_condition"])
+        self.assertNotIn(">=", result["version_condition"])
 
 
 class CrossStackTests(unittest.TestCase):

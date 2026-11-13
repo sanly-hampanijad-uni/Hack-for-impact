@@ -1,5 +1,6 @@
 import copy
 import json
+import re
 
 from .clients import ServiceError
 from .tools import TOOLS
@@ -104,14 +105,21 @@ def validate_assessment(data, evidence, condition_names=None, plan=None):
     if not isinstance(data["conditions"], list):
         raise ValueError("conditions must be a list")
     usable = {e["id"] for e in evidence if "error" not in e["result"]}
+    known = {e["id"] for e in evidence}
     seen = set()
     for condition in data["conditions"]:
         if not isinstance(condition, dict) or condition.get("name") not in condition_names or condition["name"] in seen:
             raise ValueError("Invalid or duplicate condition")
         seen.add(condition["name"])
         ids = condition.get("evidence_ids")
-        if not isinstance(ids, list) or any(not isinstance(e, str) or e not in usable for e in ids):
-            raise ValueError("Unknown or failed evidence reference")
+        if not isinstance(ids, list) or any(not isinstance(e, str) for e in ids):
+            raise ValueError(f"{condition['name']}: evidence_ids must be a list of IDs")
+        unknown = [e for e in ids if e not in known]
+        failed = [e for e in ids if e in known and e not in usable]
+        if unknown:
+            raise ValueError(f"{condition['name']}: unknown evidence IDs {unknown}; existing IDs: {sorted(known)}")
+        if failed and condition.get("finding") != "unknown":
+            raise ValueError(f"{condition['name']}: failed-tool evidence {failed} cannot prove or disprove a vulnerability prerequisite. Cite successful observations {sorted(usable)} instead, or mark this prerequisite unknown and explain the failed check. Empty searches alone are not disproof.")
         if not isinstance(condition.get("explanation"), str) or condition.get("finding") not in {"proven", "disproven", "unknown"}:
             raise ValueError("Invalid condition finding")
         if condition["finding"] != "unknown" and not ids:
@@ -263,6 +271,10 @@ def create_plan(cve, inventory, model, emit):
     for key in ("component", "version_condition"):
         if not isinstance(raw.get(key), str) or not raw[key].strip():
             raise ServiceError("Plan is missing component or version conditions")
+    if re.search(r"(?:>=|<=|>|<)\s*[a-f0-9]{7,40}\b", raw["version_condition"], re.I):
+        raw["version_condition"] = "Commit-based applicability requires source/ancestry verification. CVE description: " + cve.get("description", "")[:1200]
+        raw["version_warning"] = "Git hashes are identities, not ordered semantic versions; do not compare them with >= or <=."
+        emit("plan_warning", cve=cve["id"], reason=raw["version_warning"])
     triggers = raw.get("triggers")
     if not isinstance(triggers, list) or not 1 <= len(triggers) <= 4:
         raise ServiceError("Plan must have one to four CVE-specific triggers")

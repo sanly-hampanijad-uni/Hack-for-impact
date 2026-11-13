@@ -19,6 +19,8 @@ class Events:
             label += f"attempt {data['attempt']}/{data['max_attempts']} / timeout {data['timeout_seconds']}s / page offset {data['query'].get('startIndex', 0)}"
         if kind == "nvd_response":
             label += f"{data['records']} records / {data['elapsed_seconds']}s"
+            if data.get("total_results") is not None:
+                label += f" / total {data['total_results']} / page size {data.get('results_per_page')}"
         if kind == "nvd_retry":
             label += f"retry in {data['delay_seconds']}s"
         if kind == "execution_mode":
