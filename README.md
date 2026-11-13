@@ -1,4 +1,4 @@
-# Le Plan
+# Vulnerability Generation Agent
 
 [Hack for Impact Sheffield](https://events.nvidia.com/Hack-for-Impact-Sheffield)
 
@@ -196,3 +196,4 @@ the review, and the evidence/report. The latest global CVEs may be unrelated to 
 mock repository. Do not invent an exposure for the demo; use live manual CVE
 selection once a real matching vulnerability is identified. Dashboard, scheduled
 monitoring, automatic reproduction and additional language support remain stretch work.
+Proof of concept: When a CVE is discovered. You supply your codebase, and our agent will determine whether your application is vulnerable, explains the evidence, and suggests a fix.
