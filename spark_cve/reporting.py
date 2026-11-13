@@ -21,6 +21,15 @@ class Events:
             label += f"{data['records']} records / {data['elapsed_seconds']}s"
         if kind == "nvd_retry":
             label += f"retry in {data['delay_seconds']}s"
+        if kind == "execution_mode":
+            label += (f"Project checks enabled on laptop ({data.get('runner', 'docker')}); dependency downloads " + ("enabled" if data["downloads_allowed"] else "disabled")
+                      if data["enabled"] else "source inspection only; add --allow-execution for project checks")
+            if data.get("missing_runtimes"):
+                label += " / unavailable runtimes: " + ", ".join(data["missing_runtimes"])
+        if kind == "investigation_plan":
+            label += data["plan"]["component"] + f" / {len(data['plan']['conditions'])} prerequisites"
+        if kind == "review_follow_up":
+            label += " / ".join(data["requests"])
         if data.get("error"):
             label += " / " + str(data["error"])[:300]
         print(f"[{event['time'][11:19]}] {kind}: {label}", file=sys.stderr, flush=True)
@@ -29,7 +38,7 @@ class Events:
 def markdown(results):
     lines = ["# Spark CVE investigation", "", "Local Nemotron inference on DGX Spark; repository tools execute on the laptop.",
              "", "These are evidence-based assessments of a filtered source snapshot, not a security guarantee.",
-             "Suggested diffs have not been applied or tested. Reproduction instructions have not been executed.", ""]
+             "Suggested diffs have not been applied or tested. Execution records distinguish actual checks from proposed reproduction instructions.", ""]
     for result in results:
         cve, assessment = result["cve"], result["assessment"]
         lines += [f"## {cve['id']} — {assessment['status']}", "",
@@ -40,6 +49,12 @@ def markdown(results):
         if result.get("analysis_error"):
             lines += ["**Analysis failed:** " + result["analysis_error"],
                       "This UNCERTAIN result reflects an execution failure, not a completed security investigation.", ""]
+        plan = result.get("plan")
+        if plan:
+            lines += ["### CVE-specific investigation plan", "", f"Component: {plan['component']}", ""]
+            for condition in plan["conditions"]:
+                lines += [f"- **{condition['name']}**: {condition['condition']} Proof: {condition['proof']}. Disproof: {condition['disproof']}."]
+            lines.append("")
         for condition in assessment["conditions"]:
             lines += [f"- **{condition['name']}: {condition['finding']}** — {condition['explanation']} "
                       f"({', '.join(condition['evidence_ids']) or 'no evidence'})"]
@@ -48,7 +63,21 @@ def markdown(results):
         lines += [f"- {item}" for item in assessment["missing_information"]] or ["- None reported."]
         lines += ["", "### Remediation", "", assessment["remediation"], "", "### Local reproduction", "",
                   f"Status: {assessment['reproduction_status']}", ""]
+        execution = result.get("execution")
+        if execution is not None:
+            lines += [f"Operator-configured reproduction command executed: {execution['cve_reproduction_executed']}. Suggested patch applied: no.",
+                      "An executed command or passing test is not by itself proof of a vulnerability.", ""]
         lines += [f"{i}. {step}" for i, step in enumerate(assessment["reproduction_steps"], 1)]
+        if execution is not None:
+            lines += ["", "### Project check execution", "",
+                      f"Execution enabled: {execution['enabled']}. Runner: {execution.get('runner', 'docker')} on laptop. Dependency downloads allowed: {execution['downloads_allowed']}.", ""]
+            if not execution["checks"]:
+                lines.append("No project checks were requested or executed.")
+            for check in execution["checks"]:
+                lines.append(f"- {check['check_id']}: **{check['outcome']}** (evidence {check['evidence_id']}, exit code {check['exit_code']}).")
+            lines += ["", "Check results do not by themselves prove or disprove a CVE exposure."]
+        if result.get("coverage"):
+            lines += ["", "### Analysis coverage", "", "````json", json.dumps(result["coverage"], indent=2), "````"]
         if assessment["suggested_diff"]:
             lines += ["", "### Suggested diff (unverified)", "", "````diff", assessment["suggested_diff"], "````"]
         lines += ["", "### Evidence", ""]

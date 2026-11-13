@@ -1,12 +1,17 @@
 import copy
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
-from spark_cve.agents import CONDITIONS, investigate, uncertain, validate_assessment, parse_json_response
+from spark_cve.agents import (CONDITIONS, MODEL_ASSESSMENT_SCHEMA, investigate, uncertain,
+                              validate_assessment, parse_json_response, set_execution_facts, execution_summary)
 from spark_cve.cli import parser
 from spark_cve.clients import NVD, Ollama, ServiceError, normalize_cve
 from spark_cve.reporting import write_reports
@@ -29,6 +34,17 @@ def answer(ids, status="UNCERTAIN"):
 
 
 class RepositoryTests(unittest.TestCase):
+    def test_execution_preflight_validates_local_image_without_pull(self):
+        with tempfile.TemporaryDirectory() as root:
+            repo = Repository(root, allow_execution=True, runner="docker")
+            with patch("spark_cve.tools.subprocess.run") as run:
+                run.return_value.returncode = 1
+                with self.assertRaisesRegex(ValueError, "preload"):
+                    repo.execution_preflight()
+                self.assertEqual(run.call_args.args[0], ["docker", "image", "inspect", "--", "golang:1.24"])
+                run.return_value.returncode = 0
+                self.assertTrue(repo.execution_preflight()["enabled"])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
@@ -75,6 +91,7 @@ class RepositoryTests(unittest.TestCase):
 
     def test_docker_runner_is_fixed_isolated_and_stages_filtered_source(self):
         self.repo.allow_execution = True
+        self.repo.runner = "docker"
         with patch("spark_cve.tools.subprocess.Popen") as popen, patch("spark_cve.tools.subprocess.run"):
             popen.return_value.wait.return_value = 0
             def inspect_command(command, **kwargs):
@@ -87,6 +104,51 @@ class RepositoryTests(unittest.TestCase):
                 return popen.return_value
             popen.side_effect = inspect_command
             self.assertEqual(self.repo.run_check("go_test")["exit_code"], 0)
+
+    def test_local_preflight_requires_go_without_calling_docker(self):
+        self.repo.allow_execution = True
+        with patch("spark_cve.tools.shutil.which", return_value=None), patch("spark_cve.tools.subprocess.run") as run:
+            self.assertIn("go", self.repo.execution_preflight()["missing_runtimes"])
+            run.assert_not_called()
+
+    def test_local_runner_uses_copy_fixed_arguments_and_filtered_environment(self):
+        self.repo.allow_execution = True
+        (self.root / "page.html").write_text("<h1>Go embed fixture</h1>")
+        with patch("spark_cve.tools.shutil.which", return_value="/toolchain/go"), patch("spark_cve.tools.subprocess.Popen") as popen:
+            popen.return_value.wait.return_value = 0
+            def inspect(command, **kwargs):
+                self.assertEqual(command, ["/toolchain/go", "test", "-count=1", "-timeout=45s", "-v", "./..."])
+                work = Path(kwargs["cwd"])
+                self.assertNotEqual(work, self.root)
+                self.assertTrue((work / "go.mod").exists())
+                self.assertTrue((work / "page.html").exists())
+                self.assertFalse((work / ".env").exists())
+                self.assertNotIn("NVD_API_KEY", kwargs["env"])
+                self.assertEqual(kwargs["env"]["GOPROXY"], "off")
+                self.assertEqual(kwargs["env"]["GOTOOLCHAIN"], "local")
+                (work / "go.mod").write_text("changed by test")
+                return popen.return_value
+            popen.side_effect = inspect
+            self.assertEqual(self.repo.run_check("go_test")["runner"], "local")
+            self.assertTrue((self.root / "go.mod").read_text().startswith("module example.test"))
+
+    def test_local_timeout_terminates_process_group(self):
+        self.repo.allow_execution = True
+        with patch("spark_cve.tools.shutil.which", return_value="/go"), patch("spark_cve.tools.subprocess.Popen") as popen, patch("spark_cve.tools.os.killpg") as killpg:
+            popen.return_value.wait.side_effect = [subprocess.TimeoutExpired("go", 90), 0]
+            result = self.repo.run_check("go_test")
+            self.assertEqual(result["error"], "Check timed out")
+            if os.name == "posix":
+                killpg.assert_called_once()
+            else:
+                popen.return_value.kill.assert_called_once()
+
+    @unittest.skipUnless(shutil.which("go"), "Go is not installed on this machine")
+    def test_real_local_go_on_dependency_free_fixture(self):
+        (self.root / "go.mod").write_text("module example.test/fixture\ngo 1.18\n")
+        repo = Repository(self.root, allow_execution=True)
+        result = repo.run_check("go_test")
+        self.assertEqual(result.get("exit_code"), 0, result)
 
 
 class NVDTests(unittest.TestCase):
@@ -170,6 +232,38 @@ class NVDTests(unittest.TestCase):
 
 
 class AgentTests(unittest.TestCase):
+    def setUp(self):
+        self.plan_patch = patch("spark_cve.agents.create_plan", return_value={
+            "component": "fixture", "component_kind": "unknown", "version_condition": "unknown",
+            "conditions": [{"name": name, "condition": name, "proof": "source", "disproof": "source"} for name in CONDITIONS],
+            "trigger_logic": "all"})
+        self.plan_patch.start()
+        self.addCleanup(self.plan_patch.stop)
+
+    def test_reproduction_status_owned_by_application(self):
+        self.assertNotIn("reproduction_status", MODEL_ASSESSMENT_SCHEMA["properties"])
+        self.assertNotIn("reproduction_status", MODEL_ASSESSMENT_SCHEMA["required"])
+        data = answer([])
+        data["reproduction_status"] = "succeeded"
+        data["reproduction_steps"] = ["Inspect the supplied local fixture."]
+        fixed = set_execution_facts(data)
+        self.assertEqual(fixed["reproduction_status"], "instructions_only")
+        validate_assessment(fixed, [])
+        data.pop("reproduction_status")
+        data["reproduction_steps"] = []
+        self.assertEqual(set_execution_facts(data)["reproduction_status"], "not_run")
+
+    def test_generic_check_results_do_not_become_cve_reproduction(self):
+        with tempfile.TemporaryDirectory() as root:
+            repo = Repository(root, allow_execution=True)
+            repo.evidence = [{"id": "E1", "agent": "investigator", "tool": "run_check",
+                              "arguments": {"check_id": "go_test"}, "result": {"exit_code": 0}}]
+            summary = execution_summary(repo)
+            self.assertEqual(summary["checks"][0]["outcome"], "passed")
+            self.assertFalse(summary["cve_reproduction_executed"])
+            repo.evidence[0]["result"] = {"error": "Check timed out"}
+            self.assertEqual(execution_summary(repo)["checks"][0]["outcome"], "timed_out")
+
     def test_keyed_conditions_normalize_without_duplicates(self):
         data = answer([])
         data["conditions"] = {c["name"]: {k: v for k, v in c.items() if k != "name"} for c in data["conditions"]}
@@ -182,7 +276,8 @@ class AgentTests(unittest.TestCase):
     def test_testing_defaults(self):
         args = parser().parse_args(["scan", "."])
         self.assertEqual(args.limit, 2)
-        self.assertEqual(args.max_turns, 6)
+        self.assertEqual(args.max_turns, 8)
+        self.assertEqual(args.runner, "local")
 
     def test_no_tool_calls_stop_after_two_attempts_and_skip_review(self):
         with tempfile.TemporaryDirectory() as root:
@@ -197,7 +292,7 @@ class AgentTests(unittest.TestCase):
             result = investigate(normalize_cve(record()), Repository(root), model, lambda kind, **kw: events.append(kind))
             self.assertEqual(model.count, 2)
             self.assertEqual(result["review_state"], "skipped")
-            self.assertIn("No structured tool calls", result["analysis_error"])
+            self.assertIn("source inspection", result["analysis_error"])
             self.assertEqual(events.count("validation_error"), 2)
             self.assertIn("review_skipped", events)
 
@@ -214,7 +309,7 @@ class AgentTests(unittest.TestCase):
             result = investigate(normalize_cve(record()), Repository(root), model, lambda *a, **k: None)
             self.assertEqual(model.count, 2)
             self.assertEqual(result["review_state"], "skipped")
-            self.assertEqual(len(result["evidence"]), 2)
+            self.assertEqual(sum(e["tool"] == "read_file" for e in result["evidence"]), 2)
 
     def test_repeated_identical_successful_tool_calls_are_not_progress(self):
         with tempfile.TemporaryDirectory() as root:
@@ -272,14 +367,17 @@ class AgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "go.mod").write_text("module example.test/app\ngo 1.23.0\n")
+            (root / "main.go").write_text("package main\nfunc main() {}\n")
             repo = Repository(root)
             messages = [
-                {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "inspect_dependencies", "arguments": {}}}]},
+                {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "main.go"}}}]},
                 {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "finish_investigation", "arguments": {}}}]},
-                {"role": "assistant", "content": json.dumps(answer(["E1"]))},
-                {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "go.mod"}}}]},
+                # Regression: the model's unsupported execution claim must not
+                # discard gathered evidence, skip review, or stop the batch.
+                {"role": "assistant", "content": json.dumps({**answer(["E3"]), "reproduction_status": "failed"})},
+                {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "main.go"}}}]},
                 {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "finish_investigation", "arguments": {}}}]},
-                {"role": "assistant", "content": json.dumps(answer(["E2"]))},
+                {"role": "assistant", "content": json.dumps({**answer(["E4"]), "reproduction_status": "succeeded"})},
             ]
             class ScriptedModel:
                 model = "test-transport-not-real-inference"
@@ -288,9 +386,15 @@ class AgentTests(unittest.TestCase):
             events = []
             result = investigate(normalize_cve(record()), repo, ScriptedModel(), lambda *a, **kw: events.append((a, kw)))
             self.assertEqual(result["assessment"]["status"], "UNCERTAIN")
-            self.assertEqual([e["agent"] for e in result["evidence"]], ["investigator", "reviewer"])
+            self.assertIsNone(result["analysis_error"])
+            self.assertEqual(result["review_state"], "completed")
+            self.assertEqual(result["assessment"]["reproduction_status"], "not_run")
+            readers = [e["agent"] for e in result["evidence"] if e["tool"] == "read_file"]
+            self.assertEqual(readers[0], "investigator")
+            self.assertTrue(all(role == "reviewer" for role in readers[1:]))
             write_reports(root, [result])
             self.assertIn("E2", (root / "report.md").read_text())
+            self.assertIn("No project checks were requested or executed", (root / "report.md").read_text())
             self.assertEqual(len(json.loads((root / "report.json").read_text())), 1)
             self.assertEqual(messages, [])
 

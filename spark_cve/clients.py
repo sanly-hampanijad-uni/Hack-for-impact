@@ -23,7 +23,15 @@ def request_json(url, *, payload=None, headers=None, timeout=120):
             return json.load(response)
     except HTTPError as exc:
         # Do not expose response bodies, headers, or credentials in diagnostics.
-        raise ServiceError(f"HTTP {exc.code} from {urlparse(url).hostname}", status=exc.code) from None
+        detail = ""
+        if urlparse(url).hostname in {"localhost", "127.0.0.1", "::1"}:
+            try:
+                body = json.loads(exc.read(4096))
+                if isinstance(body, dict) and isinstance(body.get("error"), str):
+                    detail = ": " + body["error"].replace("\n", " ")[:300]
+            except (ValueError, OSError):
+                pass
+        raise ServiceError(f"HTTP {exc.code} from {urlparse(url).hostname}{detail}", status=exc.code) from None
     except (URLError, TimeoutError, OSError) as exc:
         timed_out = isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError)
         detail = f"timed out (timeout setting: {timeout}s)" if timed_out else f"failed ({type(exc).__name__})"
@@ -145,7 +153,7 @@ class Ollama:
     def chat(self, messages, tools=None, schema=None, max_tokens=None):
         payload = {"model": self.model, "messages": messages, "stream": False,
                    "think": False, "keep_alive": "30m",
-                   "options": {"num_ctx": 8192, "num_predict": max_tokens or (2048 if schema else 512), "temperature": 0}}
+                   "options": {"num_ctx": 16384, "num_predict": max_tokens or (2048 if schema else 512), "temperature": 0}}
         if tools:
             payload["tools"] = tools
         if schema:
