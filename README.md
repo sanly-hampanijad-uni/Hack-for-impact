@@ -2,6 +2,18 @@
 
 [Hack for Impact Sheffield](https://events.nvidia.com/Hack-for-Impact-Sheffield)
 
+### What are we making ? 
+Agentic Vulnerability Reporter.
+### What is it ?  
+Security infrastructure for Government and Public Sector Digital Services.
+### Link to NVidia Hack Challenge tracks 
+Public Services - It's a demonstration of cybersecurity awareness by government agencies and public sector organisations that handle sensitive information.
+### How it works ?
+The agent is called with the target codebase and it will determine whether your application is vulnerable by scanning against the latest CVEs or a specific one if specified,. It creates a report listing vulnerabilities, suggesting fixes, and proves vulnerability by exploiting it in a controlled environment.
+
+**Tag line**: Helping governments and public sector organisations demonstrate secure software engineering practices in their handling of sensitive information and confidently ensure users of the security of their data.
+
+---
 ## Challenge Tracks
 
 ### Economic Systems
@@ -29,6 +41,7 @@ to a specific CVE, using Nemotron running on NVIDIA DGX Spark. It retrieves live
 NVD records, lets an investigator choose repository tools, has a separate reviewer
 challenge the conclusion, and writes Markdown/JSON reports with captured evidence.
 
+---
 ### Quick start
 
 Python 3.11+ is sufficient. Runtime dependencies: Python standard library only.
